@@ -51,6 +51,9 @@ default_max_hops = 8
 - `POST /tasks/{id}/start`
 - `POST /tasks/{id}/permissions`
 - `POST /tasks/{id}/channels`
+- `GET /tasks/{id}/messages`
+- `GET /tasks/{id}/acks`
+- `GET /tasks/{id}/decisions`
 
 Пример:
 ```powershell
@@ -62,3 +65,16 @@ curl -Method Post -Uri http://localhost:8091/tasks -ContentType "application/jso
   "max_hops":8
 }'
 ```
+
+## Прозрачный монитор (exe окно)
+Запуск live-инспектора взаимодействий:
+
+```powershell
+& "C:\Program Files\Go\bin\go.exe" run ./cmd/monitor --addr http://localhost:8091
+```
+
+В окне мониторинга видны:
+- задачи и их статусы;
+- сообщения между агентами (`from -> to`, тип, статус, retry);
+- ack от каждого агента;
+- решения оркестратора (deny/blocked/done и причины).

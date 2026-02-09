@@ -26,6 +26,9 @@ type Store interface {
 	IncrementTaskHop(ctx context.Context, taskID string) (int, error)
 	CountPendingMessages(ctx context.Context, taskID string) (int, error)
 	CountActiveMessages(ctx context.Context, taskID string) (int, error)
+	ListTaskMessages(ctx context.Context, taskID string, limit int) ([]domain.Message, error)
+	ListTaskMessageAcks(ctx context.Context, taskID string, limit int) ([]domain.MessageAck, error)
+	ListTaskDecisions(ctx context.Context, taskID string, limit int) ([]domain.DecisionLog, error)
 
 	GrantTaskPermission(ctx context.Context, p domain.TaskPermission) error
 	GrantAgentChannel(ctx context.Context, ch domain.AgentChannel) error
@@ -178,6 +181,18 @@ func (s *Service) GetTask(ctx context.Context, taskID string) (domain.Task, erro
 
 func (s *Service) ListTasks(ctx context.Context) ([]domain.Task, error) {
 	return s.store.ListTasks(ctx)
+}
+
+func (s *Service) ListTaskMessages(ctx context.Context, taskID string, limit int) ([]domain.Message, error) {
+	return s.store.ListTaskMessages(ctx, taskID, limit)
+}
+
+func (s *Service) ListTaskMessageAcks(ctx context.Context, taskID string, limit int) ([]domain.MessageAck, error) {
+	return s.store.ListTaskMessageAcks(ctx, taskID, limit)
+}
+
+func (s *Service) ListTaskDecisions(ctx context.Context, taskID string, limit int) ([]domain.DecisionLog, error) {
+	return s.store.ListTaskDecisions(ctx, taskID, limit)
 }
 
 func (s *Service) GrantPermission(ctx context.Context, permission domain.TaskPermission) error {

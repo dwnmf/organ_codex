@@ -137,6 +137,14 @@ type FileChangeLog struct {
 	CreatedAt time.Time     `json:"created_at"`
 }
 
+type MessageAck struct {
+	ID        int64     `json:"id"`
+	MessageID string    `json:"message_id"`
+	AgentID   string    `json:"agent_id"`
+	Result    string    `json:"result"`
+	AckAt     time.Time `json:"ack_at"`
+}
+
 type TaskRequestPayload struct {
 	Goal               string   `json:"goal"`
 	Scope              string   `json:"scope"`

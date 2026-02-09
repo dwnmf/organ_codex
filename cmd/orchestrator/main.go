@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,7 +29,6 @@ import (
 type app struct {
 	cfg          config.Config
 	orchestrator *orchestrator.Service
-	store        *sqlitestore.Store
 }
 
 func main() {
@@ -104,7 +104,6 @@ func main() {
 	a := &app{
 		cfg:          cfg,
 		orchestrator: orch,
-		store:        store,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", a.handleHealth)
@@ -327,6 +326,42 @@ func (a *app) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"status": "channel granted"})
+	case "messages":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		limit := queryInt(r, "limit", 200)
+		items, err := a.orchestrator.ListTaskMessages(r.Context(), taskID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	case "acks":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		limit := queryInt(r, "limit", 400)
+		items, err := a.orchestrator.ListTaskMessageAcks(r.Context(), taskID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	case "decisions":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		limit := queryInt(r, "limit", 300)
+		items, err := a.orchestrator.ListTaskDecisions(r.Context(), taskID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown action: %s", action))
 	}
@@ -454,6 +489,18 @@ func durationMS(v int, def time.Duration) time.Duration {
 
 func intOrDefault(v int, def int) int {
 	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+func queryInt(r *http.Request, key string, def int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
 		return def
 	}
 	return v

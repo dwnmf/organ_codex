@@ -808,6 +808,123 @@ func (s *Store) CountActiveMessages(ctx context.Context, taskID string) (int, er
 	return count, nil
 }
 
+func (s *Store) ListTaskMessages(ctx context.Context, taskID string, limit int) ([]domain.Message, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, task_id, from_agent, to_agent, type, payload, correlation_id, idempotency_key,
+			status, attempts, next_attempt_at, last_error, created_at
+		FROM agent_messages
+		WHERE task_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?`,
+		taskID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list task messages: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]domain.Message, 0, limit)
+	for rows.Next() {
+		var m domain.Message
+		var typ string
+		var status string
+		var payload string
+		var nextAttemptAt int64
+		var createdAt int64
+		if err := rows.Scan(
+			&m.ID, &m.TaskID, &m.FromAgent, &m.ToAgent, &typ, &payload, &m.CorrelationID, &m.IdempotencyKey,
+			&status, &m.Attempts, &nextAttemptAt, &m.LastError, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan task message: %w", err)
+		}
+		m.Type = domain.MessageType(typ)
+		m.Payload = []byte(payload)
+		m.Status = domain.MessageStatus(status)
+		m.NextAttemptAt = unixToTime(nextAttemptAt)
+		m.CreatedAt = unixToTime(createdAt)
+		result = append(result, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task messages: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) ListTaskMessageAcks(ctx context.Context, taskID string, limit int) ([]domain.MessageAck, error) {
+	if limit <= 0 {
+		limit = 400
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT a.id, a.message_id, a.agent_id, a.result, a.ack_at
+		FROM message_acks a
+		JOIN agent_messages m ON m.id = a.message_id
+		WHERE m.task_id = ?
+		ORDER BY a.ack_at DESC
+		LIMIT ?`,
+		taskID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list task acks: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]domain.MessageAck, 0, limit)
+	for rows.Next() {
+		var item domain.MessageAck
+		var ackAt int64
+		if err := rows.Scan(&item.ID, &item.MessageID, &item.AgentID, &item.Result, &ackAt); err != nil {
+			return nil, fmt.Errorf("scan task ack: %w", err)
+		}
+		item.AckAt = unixToTime(ackAt)
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task acks: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) ListTaskDecisions(ctx context.Context, taskID string, limit int) ([]domain.DecisionLog, error) {
+	if limit <= 0 {
+		limit = 300
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, task_id, actor, action, reason, payload, created_at
+		FROM decision_log
+		WHERE task_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?`,
+		taskID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list task decisions: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]domain.DecisionLog, 0, limit)
+	for rows.Next() {
+		var item domain.DecisionLog
+		var payload string
+		var createdAt int64
+		if err := rows.Scan(&item.ID, &item.TaskID, &item.Actor, &item.Action, &item.Reason, &payload, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan decision: %w", err)
+		}
+		item.Payload = []byte(payload)
+		item.CreatedAt = unixToTime(createdAt)
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate decisions: %w", err)
+	}
+	return result, nil
+}
+
 func int64ToTimePtr(v sql.NullInt64) *time.Time {
 	if !v.Valid || v.Int64 <= 0 {
 		return nil
