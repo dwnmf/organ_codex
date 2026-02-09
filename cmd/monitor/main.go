@@ -85,6 +85,11 @@ func main() {
 		SetWrap(false)
 	decisionsView.SetTitle("Decisions").SetBorder(true)
 
+	agentStateView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(false)
+	agentStateView.SetTitle("Agent State").SetBorder(true)
+
 	promptInput := tview.NewInputField().
 		SetLabel("Prompt -> Orchestrator: ")
 	promptInput.SetBorder(true).SetTitle("Enter = create+start task")
@@ -104,6 +109,7 @@ func main() {
 		AddItem(acksView, 0, 1, false)
 	right := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(rightTop, 0, 3, false).
+		AddItem(agentStateView, 8, 0, false).
 		AddItem(decisionsView, 0, 2, false)
 
 	mainLayout := tview.NewFlex().
@@ -154,6 +160,7 @@ func main() {
 		app.QueueUpdateDraw(func() {
 			messagesView.SetText("Loading...")
 			acksView.SetText("Loading...")
+			agentStateView.SetText("Loading...")
 			decisionsView.SetText("Loading...")
 		})
 
@@ -214,6 +221,7 @@ func main() {
 				} else {
 					decisionsView.SetText(renderDecisions(decisionRes.items))
 				}
+				agentStateView.SetText(renderAgentState(selected, lastTasks, msgRes.items, ackRes.items, decisionRes.items))
 			})
 		}(taskID, version)
 	}
@@ -481,6 +489,155 @@ func renderDecisions(items []domain.DecisionLog) string {
 		}
 	}
 	return b.String()
+}
+
+type agentStateLine struct {
+	Agent      string
+	State      string
+	LastAction string
+	LastReason string
+	LastAt     time.Time
+	LastAck    string
+	InFlight   int
+}
+
+func renderAgentState(
+	taskID string,
+	tasks []domain.Task,
+	messages []domain.Message,
+	acks []domain.MessageAck,
+	decisions []domain.DecisionLog,
+) string {
+	if strings.TrimSpace(taskID) == "" {
+		return "No task selected"
+	}
+
+	taskStatus := "unknown"
+	for _, t := range tasks {
+		if t.ID == taskID {
+			taskStatus = string(t.Status)
+			break
+		}
+	}
+
+	lines := map[string]*agentStateLine{
+		"planner":      {Agent: "planner", State: "idle"},
+		"coder":        {Agent: "coder", State: "idle"},
+		"orchestrator": {Agent: "orchestrator", State: "idle"},
+	}
+
+	ackedByAgent := map[string]map[string]bool{}
+	lastAckByAgent := map[string]domain.MessageAck{}
+	for _, ack := range acks {
+		if _, ok := ackedByAgent[ack.AgentID]; !ok {
+			ackedByAgent[ack.AgentID] = map[string]bool{}
+		}
+		ackedByAgent[ack.AgentID][ack.MessageID] = true
+		if prev, ok := lastAckByAgent[ack.AgentID]; !ok || ack.AckAt.After(prev.AckAt) {
+			lastAckByAgent[ack.AgentID] = ack
+		}
+	}
+
+	for _, msg := range messages {
+		line, ok := lines[msg.ToAgent]
+		if !ok {
+			continue
+		}
+		acked := false
+		if byAgent, ok := ackedByAgent[msg.ToAgent]; ok {
+			acked = byAgent[msg.ID]
+		}
+		if (msg.Status == domain.MessageStatusPending || msg.Status == domain.MessageStatusDelivered) && !acked {
+			line.InFlight++
+		}
+	}
+
+	for _, d := range decisions {
+		line, ok := lines[d.Actor]
+		if !ok {
+			continue
+		}
+		if line.LastAt.IsZero() || d.CreatedAt.After(line.LastAt) {
+			line.LastAt = d.CreatedAt
+			line.LastAction = d.Action
+			line.LastReason = d.Reason
+			line.State = classifyAgentState(d.Actor, d.Action, taskStatus)
+		}
+	}
+
+	for agentID, ack := range lastAckByAgent {
+		line, ok := lines[agentID]
+		if !ok {
+			continue
+		}
+		line.LastAck = trimLine(ack.Result, 64)
+	}
+
+	order := []string{"orchestrator", "planner", "coder"}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Task: %s  status=%s\n", shortID(taskID), taskStatus))
+	for _, id := range order {
+		line := lines[id]
+		lastAt := "-"
+		if !line.LastAt.IsZero() {
+			lastAt = line.LastAt.Format("15:04:05")
+		}
+		b.WriteString(fmt.Sprintf(
+			"%-12s state=%-12s inflight=%d last=%s action=%s\n",
+			line.Agent, line.State, line.InFlight, lastAt, trimLine(line.LastAction, 28),
+		))
+		if line.LastReason != "" {
+			b.WriteString("  reason: " + trimLine(line.LastReason, 120) + "\n")
+		}
+		if line.LastAck != "" {
+			b.WriteString("  ack: " + line.LastAck + "\n")
+		}
+	}
+	return b.String()
+}
+
+func classifyAgentState(actor, action, taskStatus string) string {
+	switch actor {
+	case "coder":
+		switch action {
+		case "codex_exec_started", "codex_exec_progress":
+			return "working"
+		case "file_written":
+			return "writing"
+		case "done_sent":
+			return "done"
+		case "codex_exec_failed", "no_files_created", "done_send_failed", "file_write_failed", "file_path_invalid":
+			return "error"
+		default:
+			return "idle"
+		}
+	case "planner":
+		switch action {
+		case "forwarded_to_coder", "message_received":
+			return "coordinating"
+		case "notified_orchestrator_done":
+			return "done"
+		case "forward_failed", "notify_orchestrator_failed":
+			return "error"
+		default:
+			return "idle"
+		}
+	case "orchestrator":
+		switch taskStatus {
+		case string(domain.TaskStatusRunning):
+			return "running"
+		case string(domain.TaskStatusDone):
+			return "done"
+		case string(domain.TaskStatusBlocked):
+			return "blocked"
+		case string(domain.TaskStatusFailed):
+			return "failed"
+		default:
+			return "idle"
+		}
+	default:
+		return "unknown"
+	}
 }
 
 func decisionPayloadSummary(payload []byte) string {
