@@ -217,6 +217,15 @@ func main() {
 	})
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if app.GetFocus() == promptInput {
+			if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyTAB {
+				app.SetFocus(tasksTable)
+				setStatus("Focus -> tasks")
+				return nil
+			}
+			return event
+		}
+
 		if event.Key() == tcell.KeyEscape {
 			app.SetFocus(tasksTable)
 			setStatus("Focus -> tasks")
@@ -244,7 +253,7 @@ func main() {
 			}
 			return nil
 		}
-		if event.Key() == tcell.KeyRune && app.GetFocus() != promptInput {
+		if event.Key() == tcell.KeyRune {
 			app.SetFocus(promptInput)
 			return event
 		}
