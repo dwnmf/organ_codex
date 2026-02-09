@@ -117,7 +117,10 @@ func main() {
 	var selectedTaskID string
 	var lastTasks []domain.Task
 
-	setStatus := func(msg string) {
+	setStatusUI := func(msg string) {
+		statusView.SetText(msg)
+	}
+	setStatusAsync := func(msg string) {
 		app.QueueUpdateDraw(func() {
 			statusView.SetText(msg)
 		})
@@ -184,20 +187,18 @@ func main() {
 		if prompt == "" {
 			return
 		}
-		setStatus("Creating task from prompt...")
-		app.QueueUpdateDraw(func() {
-			promptInput.SetText("")
-		})
+		setStatusUI("Creating task from prompt...")
+		promptInput.SetText("")
 		go func(input string) {
 			taskID, err := c.createAndStartTaskFromPrompt(input)
 			if err != nil {
-				setStatus("Failed to create/start task: " + err.Error())
+				setStatusAsync("Failed to create/start task: " + err.Error())
 				return
 			}
 			selectedTaskID = taskID
 			refreshTasks()
 			refreshDetails()
-			setStatus("Task started: " + taskID)
+			setStatusAsync("Task started: " + taskID)
 		}(prompt)
 	}
 
@@ -220,7 +221,7 @@ func main() {
 		if app.GetFocus() == promptInput {
 			if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyTAB {
 				app.SetFocus(tasksTable)
-				setStatus("Focus -> tasks")
+				setStatusUI("Focus -> tasks")
 				return nil
 			}
 			return event
@@ -228,7 +229,7 @@ func main() {
 
 		if event.Key() == tcell.KeyEscape {
 			app.SetFocus(tasksTable)
-			setStatus("Focus -> tasks")
+			setStatusUI("Focus -> tasks")
 			return nil
 		}
 		switch event.Key() {
@@ -238,15 +239,15 @@ func main() {
 		case tcell.KeyF5:
 			refreshTasks()
 			refreshDetails()
-			setStatus("Manual refresh complete")
+			setStatusUI("Manual refresh complete")
 			return nil
 		case tcell.KeyCtrlL:
 			app.SetFocus(promptInput)
-			setStatus("Focus -> prompt")
+			setStatusUI("Focus -> prompt")
 			return nil
 		case tcell.KeyCtrlT:
 			app.SetFocus(tasksTable)
-			setStatus("Focus -> tasks")
+			setStatusUI("Focus -> tasks")
 			return nil
 		}
 		if event.Key() == tcell.KeyTAB {
