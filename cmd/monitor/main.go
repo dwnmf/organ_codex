@@ -93,7 +93,7 @@ func main() {
 		SetWrap(false)
 	statusView.SetBorder(true).SetTitle("Status")
 	statusView.SetText(fmt.Sprintf(
-		"Connected to %s | embedded=%t | shortcuts: q quit, r refresh, / focus prompt, esc focus tasks",
+		"Connected to %s | embedded=%t | shortcuts: F10 quit, F5 refresh, Ctrl+L focus prompt, Ctrl+T focus tasks",
 		c.baseURL,
 		*embedded,
 	))
@@ -231,18 +231,22 @@ func main() {
 			setStatus("Focus -> tasks")
 			return nil
 		}
-		switch event.Rune() {
-		case 'q', 'Q':
+		switch event.Key() {
+		case tcell.KeyF10:
 			app.Stop()
 			return nil
-		case 'r', 'R':
+		case tcell.KeyF5:
 			refreshTasks()
 			refreshDetails()
 			setStatus("Manual refresh complete")
 			return nil
-		case '/':
+		case tcell.KeyCtrlL:
 			app.SetFocus(promptInput)
 			setStatus("Focus -> prompt")
+			return nil
+		case tcell.KeyCtrlT:
+			app.SetFocus(tasksTable)
+			setStatus("Focus -> tasks")
 			return nil
 		}
 		if event.Key() == tcell.KeyTAB {

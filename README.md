@@ -78,6 +78,12 @@ curl -Method Post -Uri http://localhost:8091/tasks -ContentType "application/jso
 - выдаст стандартные permissions/channels;
 - запустит выполнение.
 
+Горячие клавиши:
+- `F5` обновить
+- `F10` выход
+- `Ctrl+L` фокус в prompt
+- `Ctrl+T` фокус на таблицу задач
+
 В правых панелях видны:
 - задачи и их статусы;
 - сообщения между агентами (`from -> to`, тип, статус, retry);
