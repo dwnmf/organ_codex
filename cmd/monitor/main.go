@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -116,6 +117,7 @@ func main() {
 
 	var selectedTaskID string
 	var lastTasks []domain.Task
+	var detailsVersion uint64
 
 	setStatusUI := func(msg string) {
 		statusView.SetText(msg)
@@ -144,42 +146,76 @@ func main() {
 		})
 	}
 
-	refreshDetails := func() {
-		if selectedTaskID == "" {
+	refreshDetailsAsync := func(taskID string) {
+		if strings.TrimSpace(taskID) == "" {
 			return
 		}
-		msgs, err := c.listTaskMessages(selectedTaskID, 120)
-		if err != nil {
-			app.QueueUpdateDraw(func() {
-				messagesView.SetText(fmt.Sprintf("error: %v", err))
-			})
-		} else {
-			app.QueueUpdateDraw(func() {
-				messagesView.SetText(renderMessages(msgs))
-			})
-		}
+		version := atomic.AddUint64(&detailsVersion, 1)
+		app.QueueUpdateDraw(func() {
+			messagesView.SetText("Loading...")
+			acksView.SetText("Loading...")
+			decisionsView.SetText("Loading...")
+		})
 
-		acks, err := c.listTaskAcks(selectedTaskID, 160)
-		if err != nil {
-			app.QueueUpdateDraw(func() {
-				acksView.SetText(fmt.Sprintf("error: %v", err))
-			})
-		} else {
-			app.QueueUpdateDraw(func() {
-				acksView.SetText(renderAcks(acks))
-			})
-		}
+		go func(selected string, v uint64) {
+			type msgResult struct {
+				items []domain.Message
+				err   error
+			}
+			type ackResult struct {
+				items []domain.MessageAck
+				err   error
+			}
+			type decisionResult struct {
+				items []domain.DecisionLog
+				err   error
+			}
 
-		decisions, err := c.listTaskDecisions(selectedTaskID, 120)
-		if err != nil {
+			msgCh := make(chan msgResult, 1)
+			ackCh := make(chan ackResult, 1)
+			decisionCh := make(chan decisionResult, 1)
+
+			go func() {
+				items, err := c.listTaskMessages(selected, 200)
+				msgCh <- msgResult{items: items, err: err}
+			}()
+			go func() {
+				items, err := c.listTaskAcks(selected, 250)
+				ackCh <- ackResult{items: items, err: err}
+			}()
+			go func() {
+				items, err := c.listTaskDecisions(selected, 250)
+				decisionCh <- decisionResult{items: items, err: err}
+			}()
+
+			msgRes := <-msgCh
+			ackRes := <-ackCh
+			decisionRes := <-decisionCh
+
+			if atomic.LoadUint64(&detailsVersion) != v {
+				return
+			}
 			app.QueueUpdateDraw(func() {
-				decisionsView.SetText(fmt.Sprintf("error: %v", err))
+				if selected != selectedTaskID {
+					return
+				}
+				if msgRes.err != nil {
+					messagesView.SetText(fmt.Sprintf("error: %v", msgRes.err))
+				} else {
+					messagesView.SetText(renderMessages(msgRes.items))
+				}
+				if ackRes.err != nil {
+					acksView.SetText(fmt.Sprintf("error: %v", ackRes.err))
+				} else {
+					acksView.SetText(renderAcks(ackRes.items))
+				}
+				if decisionRes.err != nil {
+					decisionsView.SetText(fmt.Sprintf("error: %v", decisionRes.err))
+				} else {
+					decisionsView.SetText(renderDecisions(decisionRes.items))
+				}
 			})
-		} else {
-			app.QueueUpdateDraw(func() {
-				decisionsView.SetText(renderDecisions(decisions))
-			})
-		}
+		}(taskID, version)
 	}
 
 	submitPrompt := func(prompt string) {
@@ -197,7 +233,7 @@ func main() {
 			}
 			selectedTaskID = taskID
 			refreshTasks()
-			refreshDetails()
+			refreshDetailsAsync(selectedTaskID)
 			setStatusAsync("Task started: " + taskID)
 		}(prompt)
 	}
@@ -214,7 +250,7 @@ func main() {
 			return
 		}
 		selectedTaskID = lastTasks[row-1].ID
-		refreshDetails()
+		refreshDetailsAsync(selectedTaskID)
 	})
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -238,7 +274,7 @@ func main() {
 			return nil
 		case tcell.KeyF5:
 			refreshTasks()
-			refreshDetails()
+			refreshDetailsAsync(selectedTaskID)
 			setStatusUI("Manual refresh complete")
 			return nil
 		case tcell.KeyCtrlL:
@@ -277,7 +313,7 @@ func main() {
 			}
 		}
 		if selectedTaskID != "" {
-			refreshDetails()
+			refreshDetailsAsync(selectedTaskID)
 		}
 
 		for range ticker.C {
@@ -285,7 +321,7 @@ func main() {
 			if selectedTaskID == "" && len(lastTasks) > 0 {
 				selectedTaskID = lastTasks[0].ID
 			}
-			refreshDetails()
+			refreshDetailsAsync(selectedTaskID)
 		}
 	}()
 
