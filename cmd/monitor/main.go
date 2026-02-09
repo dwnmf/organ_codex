@@ -93,7 +93,7 @@ func main() {
 		SetWrap(false)
 	statusView.SetBorder(true).SetTitle("Status")
 	statusView.SetText(fmt.Sprintf(
-		"Connected to %s | embedded=%t | shortcuts: q quit, r refresh",
+		"Connected to %s | embedded=%t | shortcuts: q quit, r refresh, / focus prompt, esc focus tasks",
 		c.baseURL,
 		*embedded,
 	))
@@ -185,18 +185,20 @@ func main() {
 			return
 		}
 		setStatus("Creating task from prompt...")
-		taskID, err := c.createAndStartTaskFromPrompt(prompt)
-		if err != nil {
-			setStatus("Failed to create/start task: " + err.Error())
-			return
-		}
-		selectedTaskID = taskID
 		app.QueueUpdateDraw(func() {
 			promptInput.SetText("")
 		})
-		refreshTasks()
-		refreshDetails()
-		setStatus("Task started: " + taskID)
+		go func(input string) {
+			taskID, err := c.createAndStartTaskFromPrompt(input)
+			if err != nil {
+				setStatus("Failed to create/start task: " + err.Error())
+				return
+			}
+			selectedTaskID = taskID
+			refreshTasks()
+			refreshDetails()
+			setStatus("Task started: " + taskID)
+		}(prompt)
 	}
 
 	promptInput.SetDoneFunc(func(key tcell.Key) {
@@ -215,6 +217,11 @@ func main() {
 	})
 
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			app.SetFocus(tasksTable)
+			setStatus("Focus -> tasks")
+			return nil
+		}
 		switch event.Rune() {
 		case 'q', 'Q':
 			app.Stop()
@@ -224,6 +231,10 @@ func main() {
 			refreshDetails()
 			setStatus("Manual refresh complete")
 			return nil
+		case '/':
+			app.SetFocus(promptInput)
+			setStatus("Focus -> prompt")
+			return nil
 		}
 		if event.Key() == tcell.KeyTAB {
 			if app.GetFocus() == promptInput {
@@ -232,6 +243,10 @@ func main() {
 				app.SetFocus(promptInput)
 			}
 			return nil
+		}
+		if event.Key() == tcell.KeyRune && app.GetFocus() != promptInput {
+			app.SetFocus(promptInput)
+			return event
 		}
 		return event
 	})
