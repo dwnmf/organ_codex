@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -22,23 +27,47 @@ type client struct {
 	http    *http.Client
 }
 
+type embeddedOrchestrator struct {
+	cmd *exec.Cmd
+}
+
 func main() {
 	addr := flag.String("addr", "http://localhost:8091", "orchestrator base URL")
 	interval := flag.Duration("interval", 2*time.Second, "refresh interval")
+	embedded := flag.Bool("embedded", true, "start orchestrator in the same monitor process lifecycle")
+	orchestratorBinary := flag.String("orchestrator-bin", "", "path to orchestrator binary (optional in embedded mode)")
+	dbPath := flag.String("db", "data/embedded.db", "sqlite db path for embedded orchestrator")
+	workspaceRoot := flag.String("workspace", "workspace", "workspace root for embedded orchestrator")
 	flag.Parse()
 
 	c := &client{
 		baseURL: strings.TrimRight(*addr, "/"),
 		http: &http.Client{
-			Timeout: 6 * time.Second,
+			Timeout: 10 * time.Second,
 		},
+	}
+
+	var embeddedProc *embeddedOrchestrator
+	var err error
+	if *embedded {
+		embeddedProc, err = startEmbeddedOrchestrator(*addr, *orchestratorBinary, *dbPath, *workspaceRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start embedded orchestrator: %v\n", err)
+			os.Exit(1)
+		}
+		defer embeddedProc.Stop()
+	}
+
+	if err := waitHealth(c, 30*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "orchestrator health check failed: %v\n", err)
+		os.Exit(1)
 	}
 
 	app := tview.NewApplication()
 	tasksTable := tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false)
-	tasksTable.SetTitle("Tasks (Enter to inspect, q to quit)").SetBorder(true)
+	tasksTable.SetTitle("Tasks (Enter to inspect, q to quit, r refresh)").SetBorder(true)
 
 	messagesView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -55,6 +84,20 @@ func main() {
 		SetWrap(false)
 	decisionsView.SetTitle("Decisions").SetBorder(true)
 
+	promptInput := tview.NewInputField().
+		SetLabel("Prompt -> Orchestrator: ")
+	promptInput.SetBorder(true).SetTitle("Enter = create+start task")
+
+	statusView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(false)
+	statusView.SetBorder(true).SetTitle("Status")
+	statusView.SetText(fmt.Sprintf(
+		"Connected to %s | embedded=%t | shortcuts: q quit, r refresh",
+		c.baseURL,
+		*embedded,
+	))
+
 	rightTop := tview.NewFlex().
 		AddItem(messagesView, 0, 2, false).
 		AddItem(acksView, 0, 1, false)
@@ -62,12 +105,23 @@ func main() {
 		AddItem(rightTop, 0, 3, false).
 		AddItem(decisionsView, 0, 2, false)
 
-	layout := tview.NewFlex().
-		AddItem(tasksTable, 0, 1, true).
+	mainLayout := tview.NewFlex().
+		AddItem(tasksTable, 0, 1, false).
 		AddItem(right, 0, 2, false)
+
+	root := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(mainLayout, 0, 12, false).
+		AddItem(promptInput, 3, 0, true).
+		AddItem(statusView, 3, 0, false)
 
 	var selectedTaskID string
 	var lastTasks []domain.Task
+
+	setStatus := func(msg string) {
+		app.QueueUpdateDraw(func() {
+			statusView.SetText(msg)
+		})
+	}
 
 	refreshTasks := func() {
 		tasks, err := c.listTasks()
@@ -125,6 +179,33 @@ func main() {
 		}
 	}
 
+	submitPrompt := func(prompt string) {
+		prompt = strings.TrimSpace(prompt)
+		if prompt == "" {
+			return
+		}
+		setStatus("Creating task from prompt...")
+		taskID, err := c.createAndStartTaskFromPrompt(prompt)
+		if err != nil {
+			setStatus("Failed to create/start task: " + err.Error())
+			return
+		}
+		selectedTaskID = taskID
+		app.QueueUpdateDraw(func() {
+			promptInput.SetText("")
+		})
+		refreshTasks()
+		refreshDetails()
+		setStatus("Task started: " + taskID)
+	}
+
+	promptInput.SetDoneFunc(func(key tcell.Key) {
+		if key != tcell.KeyEnter {
+			return
+		}
+		submitPrompt(promptInput.GetText())
+	})
+
 	tasksTable.SetSelectedFunc(func(row, _ int) {
 		if row <= 0 || row > len(lastTasks) {
 			return
@@ -141,6 +222,15 @@ func main() {
 		case 'r', 'R':
 			refreshTasks()
 			refreshDetails()
+			setStatus("Manual refresh complete")
+			return nil
+		}
+		if event.Key() == tcell.KeyTAB {
+			if app.GetFocus() == promptInput {
+				app.SetFocus(tasksTable)
+			} else {
+				app.SetFocus(promptInput)
+			}
 			return nil
 		}
 		return event
@@ -170,10 +260,84 @@ func main() {
 		}
 	}()
 
-	if err := app.SetRoot(layout, true).EnableMouse(true).Run(); err != nil {
+	if err := app.SetRoot(root, true).EnableMouse(true).SetFocus(promptInput).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "monitor failed: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func waitHealth(c *client, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodGet, c.baseURL+"/healthz", nil)
+		if err == nil {
+			resp, err := c.http.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode < 300 {
+					return nil
+				}
+			}
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for /healthz")
+}
+
+func startEmbeddedOrchestrator(addr string, orchestratorBinary string, dbPath string, workspaceRoot string) (*embeddedOrchestrator, error) {
+	parsed, err := url.Parse(addr)
+	if err != nil {
+		return nil, fmt.Errorf("parse addr: %w", err)
+	}
+	port := parsed.Port()
+	if port == "" {
+		return nil, fmt.Errorf("addr must include explicit port, got %q", addr)
+	}
+	addrArg := ":" + port
+
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	if err := os.MkdirAll(workspaceRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("create workspace root: %w", err)
+	}
+
+	var cmd *exec.Cmd
+	if strings.TrimSpace(orchestratorBinary) != "" {
+		cmd = exec.Command(orchestratorBinary, "--addr", addrArg, "--db", dbPath, "--workspace", workspaceRoot)
+	} else {
+		self, err := os.Executable()
+		if err == nil {
+			sibling := filepath.Join(filepath.Dir(self), "orchestrator.exe")
+			if fileExists(sibling) {
+				cmd = exec.Command(sibling, "--addr", addrArg, "--db", dbPath, "--workspace", workspaceRoot)
+			}
+		}
+		if cmd == nil {
+			cmd = exec.Command("go", "run", "./cmd/orchestrator", "--addr", addrArg, "--db", dbPath, "--workspace", workspaceRoot)
+			cwd, _ := os.Getwd()
+			cmd.Dir = cwd
+		}
+	}
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start orchestrator process: %w", err)
+	}
+
+	proc := &embeddedOrchestrator{cmd: cmd}
+	return proc, nil
+}
+
+func (e *embeddedOrchestrator) Stop() {
+	if e == nil || e.cmd == nil || e.cmd.Process == nil {
+		return
+	}
+	_ = e.cmd.Process.Kill()
+	_, _ = e.cmd.Process.Wait()
 }
 
 func renderTasksTable(table *tview.Table, tasks []domain.Task, selectedTaskID string) {
@@ -251,6 +415,49 @@ func renderDecisions(items []domain.DecisionLog) string {
 	return b.String()
 }
 
+func (c *client) createAndStartTaskFromPrompt(prompt string) (string, error) {
+	createReq := map[string]any{
+		"goal":          prompt,
+		"scope":         "Autonomous implementation from prompt",
+		"owner_agent":   "planner",
+		"priority":      10,
+		"budget_tokens": 30000,
+		"max_hops":      12,
+		"auto_start":    false,
+	}
+	var task domain.Task
+	if err := c.postJSON("/tasks", createReq, &task); err != nil {
+		return "", err
+	}
+
+	perms := []map[string]any{
+		{"agent_id": "coder", "effect": "allow", "operation": "create", "path_pattern": "**", "ttl_seconds": 7200},
+		{"agent_id": "coder", "effect": "allow", "operation": "write", "path_pattern": "**", "ttl_seconds": 7200},
+	}
+	for _, p := range perms {
+		if err := c.postJSON(fmt.Sprintf("/tasks/%s/permissions", task.ID), p, nil); err != nil {
+			return "", err
+		}
+	}
+
+	channels := []map[string]any{
+		{"from_agent": "planner", "to_agent": "coder", "allowed_types": []string{"REQUEST"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "coder", "to_agent": "planner", "allowed_types": []string{"DONE"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "planner", "to_agent": "orchestrator", "allowed_types": []string{"DONE", "ESCALATE"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "coder", "to_agent": "orchestrator", "allowed_types": []string{"BLOCKED"}, "max_msgs": 40, "ttl_seconds": 7200},
+	}
+	for _, ch := range channels {
+		if err := c.postJSON(fmt.Sprintf("/tasks/%s/channels", task.ID), ch, nil); err != nil {
+			return "", err
+		}
+	}
+
+	if err := c.postJSON(fmt.Sprintf("/tasks/%s/start", task.ID), map[string]any{}, nil); err != nil {
+		return "", err
+	}
+	return task.ID, nil
+}
+
 func (c *client) listTasks() ([]domain.Task, error) {
 	var out []domain.Task
 	if err := c.getJSON("/tasks", &out); err != nil {
@@ -303,6 +510,38 @@ func (c *client) getJSON(path string, out any) error {
 	return nil
 }
 
+func (c *client) postJSON(path string, in any, out any) error {
+	var payload io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		payload = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+path, payload)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("http %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if out == nil || len(body) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return err
+	}
+	return nil
+}
+
 func trimLine(s string, limit int) string {
 	if len(s) <= limit {
 		return s
@@ -315,4 +554,26 @@ func shortID(v string) string {
 		return v
 	}
 	return v[:8]
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func combineErrors(errs ...error) error {
+	var parts []string
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		parts = append(parts, err.Error())
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(parts, "; "))
 }

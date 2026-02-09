@@ -66,15 +66,26 @@ curl -Method Post -Uri http://localhost:8091/tasks -ContentType "application/jso
 }'
 ```
 
-## Прозрачный монитор (exe окно)
-Запуск live-инспектора взаимодействий:
+## Единое окно (оркестратор + монитор + ввод промпта)
+По умолчанию монитор работает в embedded-режиме: сам поднимает оркестратор и показывает live-взаимодействия в одном окне.
 
 ```powershell
-& "C:\Program Files\Go\bin\go.exe" run ./cmd/monitor --addr http://localhost:8091
+& "C:\Program Files\Go\bin\go.exe" run ./cmd/monitor --addr http://localhost:8091 --embedded
 ```
 
-В окне мониторинга видны:
+Внизу окна есть поле `Prompt -> Orchestrator`: нажмите `Enter`, и монитор автоматически:
+- создаст задачу из промпта;
+- выдаст стандартные permissions/channels;
+- запустит выполнение.
+
+В правых панелях видны:
 - задачи и их статусы;
 - сообщения между агентами (`from -> to`, тип, статус, retry);
 - ack от каждого агента;
 - решения оркестратора (deny/blocked/done и причины).
+
+Хотите использовать только UI поверх уже запущенного оркестратора:
+
+```powershell
+& "C:\Program Files\Go\bin\go.exe" run ./cmd/monitor --addr http://localhost:8091 --embedded=false
+```
