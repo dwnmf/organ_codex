@@ -87,11 +87,21 @@ func (p *Planner) Start(ctx context.Context) {
 }
 
 func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
+	logAction(ctx, p.store, msg.TaskID, p.id, "message_received", "planner received message", map[string]any{
+		"type":    msg.Type,
+		"from":    msg.FromAgent,
+		"to":      msg.ToAgent,
+		"message": msg.ID,
+	})
+
 	switch msg.Type {
 	case domain.MessageTypeRequest:
 		var req domain.TaskRequestPayload
 		if err := json.Unmarshal(msg.Payload, &req); err != nil {
 			p.logger.Printf("planner parse request failed: %v", err)
+			logAction(ctx, p.store, msg.TaskID, p.id, "message_parse_failed", "planner failed to parse request payload", map[string]any{
+				"error": err.Error(),
+			})
 			_ = p.store.AckMessage(ctx, msg.ID, p.id, "bad payload")
 			return
 		}
@@ -115,12 +125,22 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 		if err != nil {
 			result = "failed to forward to coder: " + err.Error()
 			p.logger.Printf("planner enqueue to coder failed: %v", err)
+			logAction(ctx, p.store, msg.TaskID, p.id, "forward_failed", "planner failed to forward request to coder", map[string]any{
+				"error": err.Error(),
+			})
+		} else {
+			logAction(ctx, p.store, msg.TaskID, p.id, "forwarded_to_coder", "planner forwarded request to coder", map[string]any{
+				"correlation_id": msg.CorrelationID,
+			})
 		}
 		_ = p.store.AckMessage(ctx, msg.ID, p.id, result)
 	case domain.MessageTypeDone:
 		var res domain.WorkResultPayload
 		if err := json.Unmarshal(msg.Payload, &res); err != nil {
 			p.logger.Printf("planner parse done failed: %v", err)
+			logAction(ctx, p.store, msg.TaskID, p.id, "message_parse_failed", "planner failed to parse done payload", map[string]any{
+				"error": err.Error(),
+			})
 			_ = p.store.AckMessage(ctx, msg.ID, p.id, "bad payload")
 			return
 		}
@@ -138,11 +158,25 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 		if err != nil {
 			result = "failed to notify orchestrator: " + err.Error()
 			p.logger.Printf("planner notify done failed: %v", err)
+			logAction(ctx, p.store, msg.TaskID, p.id, "notify_orchestrator_failed", "planner failed to notify orchestrator", map[string]any{
+				"error": err.Error(),
+			})
+		} else {
+			logAction(ctx, p.store, msg.TaskID, p.id, "notified_orchestrator_done", "planner sent DONE to orchestrator", map[string]any{
+				"created_files": res.CreatedFiles,
+				"summary":       trim(res.Summary, 160),
+			})
 		}
 		_ = p.store.AckMessage(ctx, msg.ID, p.id, result)
 	case domain.MessageTypeBlocked, domain.MessageTypeEscalate:
+		logAction(ctx, p.store, msg.TaskID, p.id, "blocked_or_escalated", "planner received blocked/escalate", map[string]any{
+			"type": msg.Type,
+		})
 		_ = p.store.AckMessage(ctx, msg.ID, p.id, "planner received blocked/escalate")
 	default:
+		logAction(ctx, p.store, msg.TaskID, p.id, "message_ignored", "planner ignored unsupported message type", map[string]any{
+			"type": msg.Type,
+		})
 		_ = p.store.AckMessage(ctx, msg.ID, p.id, "planner ignored message type")
 	}
 }
@@ -207,20 +241,44 @@ func (c *Coder) Start(ctx context.Context) {
 }
 
 func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
+	logAction(ctx, c.store, msg.TaskID, c.id, "message_received", "coder received message", map[string]any{
+		"type":    msg.Type,
+		"from":    msg.FromAgent,
+		"to":      msg.ToAgent,
+		"message": msg.ID,
+	})
+
 	switch msg.Type {
 	case domain.MessageTypeRequest:
 		var req domain.WorkRequestPayload
 		if err := json.Unmarshal(msg.Payload, &req); err != nil {
 			_ = c.store.AckMessage(ctx, msg.ID, c.id, "bad payload")
 			c.logger.Printf("coder parse request failed: %v", err)
+			logAction(ctx, c.store, msg.TaskID, c.id, "message_parse_failed", "coder failed to parse request payload", map[string]any{
+				"error": err.Error(),
+			})
 			return
 		}
 
+		logAction(ctx, c.store, msg.TaskID, c.id, "codex_exec_started", "coder started codex generation", map[string]any{
+			"goal":  trim(req.Goal, 180),
+			"scope": trim(req.Scope, 180),
+		})
+
 		runCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 		defer cancel()
+		stopProgress := startProgressHeartbeat(runCtx, 5*time.Second, func(elapsed time.Duration) {
+			logAction(context.Background(), c.store, msg.TaskID, c.id, "codex_exec_progress", "coder is generating with codex", map[string]any{
+				"elapsed_sec": int(elapsed.Seconds()),
+			})
+		})
 		plan, err := c.generatePlanWithCodex(runCtx, req)
+		stopProgress()
 		if err != nil {
 			c.logger.Printf("coder codex generation failed: %v", err)
+			logAction(ctx, c.store, msg.TaskID, c.id, "codex_exec_failed", "coder codex generation failed", map[string]any{
+				"error": err.Error(),
+			})
 			payload := mustJSON(map[string]string{
 				"reason": "codex generation failed: " + err.Error(),
 			})
@@ -238,6 +296,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 		}
 
 		if len(plan.Files) == 0 {
+			logAction(ctx, c.store, msg.TaskID, c.id, "codex_empty_plan", "codex returned empty file list", nil)
 			payload := mustJSON(map[string]string{
 				"reason": "codex returned empty file list",
 			})
@@ -253,16 +312,28 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 			_ = c.store.AckMessage(ctx, msg.ID, c.id, "empty plan")
 			return
 		}
+		logAction(ctx, c.store, msg.TaskID, c.id, "codex_exec_finished", "coder received file plan from codex", map[string]any{
+			"files_count": len(plan.Files),
+			"summary":     trim(plan.Summary, 160),
+		})
 
 		createdFiles := make([]string, 0, len(plan.Files))
 		for _, file := range plan.Files {
 			if err := validateRelativePath(file.Path); err != nil {
 				c.logger.Printf("coder invalid generated path %q: %v", file.Path, err)
+				logAction(ctx, c.store, msg.TaskID, c.id, "file_path_invalid", "generated path rejected", map[string]any{
+					"path":  file.Path,
+					"error": err.Error(),
+				})
 				continue
 			}
 			content := []byte(file.Content)
 			if err := c.files.WriteFile(ctx, msg.TaskID, c.id, file.Path, content); err != nil {
 				c.logger.Printf("coder write file denied/failed for %s: %v", file.Path, err)
+				logAction(ctx, c.store, msg.TaskID, c.id, "file_write_failed", "failed to write generated file", map[string]any{
+					"path":  file.Path,
+					"error": err.Error(),
+				})
 				continue
 			}
 
@@ -280,11 +351,20 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 			}
 			if err := c.store.CreateArtifact(ctx, artifact); err != nil {
 				c.logger.Printf("coder create artifact failed for %s: %v", file.Path, err)
+				logAction(ctx, c.store, msg.TaskID, c.id, "artifact_create_failed", "failed to store artifact record", map[string]any{
+					"path":  file.Path,
+					"error": err.Error(),
+				})
 			}
 			createdFiles = append(createdFiles, file.Path)
+			logAction(ctx, c.store, msg.TaskID, c.id, "file_written", "generated file written", map[string]any{
+				"path": file.Path,
+				"size": len(content),
+			})
 		}
 
 		if len(createdFiles) == 0 {
+			logAction(ctx, c.store, msg.TaskID, c.id, "no_files_created", "all generated files failed validation/write", nil)
 			payload := mustJSON(map[string]string{
 				"reason": "no files were created (policy denied or invalid paths)",
 			})
@@ -315,9 +395,20 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 			IdempotencyKey: "coder-done-" + msg.ID,
 		}); err != nil {
 			c.logger.Printf("coder send done failed: %v", err)
+			logAction(ctx, c.store, msg.TaskID, c.id, "done_send_failed", "failed to send DONE to planner", map[string]any{
+				"error": err.Error(),
+			})
+		} else {
+			logAction(ctx, c.store, msg.TaskID, c.id, "done_sent", "coder sent DONE to planner", map[string]any{
+				"created_files_count": len(createdFiles),
+				"summary":             trim(plan.Summary, 160),
+			})
 		}
 		_ = c.store.AckMessage(ctx, msg.ID, c.id, fmt.Sprintf("completed, created %d files", len(createdFiles)))
 	default:
+		logAction(ctx, c.store, msg.TaskID, c.id, "message_ignored", "coder ignored unsupported message type", map[string]any{
+			"type": msg.Type,
+		})
 		_ = c.store.AckMessage(ctx, msg.ID, c.id, "coder ignored message type")
 	}
 }
@@ -467,4 +558,60 @@ func mustJSON(v any) []byte {
 		return []byte("{}")
 	}
 	return payload
+}
+
+func logAction(ctx context.Context, store Store, taskID string, actor string, action string, reason string, payload any) {
+	if store == nil || taskID == "" || actor == "" || action == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	raw := []byte("{}")
+	if payload != nil {
+		raw = mustJSON(payload)
+	}
+	_ = store.LogDecision(ctx, domain.DecisionLog{
+		TaskID:  taskID,
+		Actor:   actor,
+		Action:  action,
+		Reason:  reason,
+		Payload: raw,
+	})
+}
+
+func startProgressHeartbeat(ctx context.Context, interval time.Duration, onTick func(elapsed time.Duration)) func() {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	stop := make(chan struct{})
+	started := time.Now()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				if onTick != nil {
+					onTick(time.Since(started))
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+	}
+}
+
+func trim(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
 }

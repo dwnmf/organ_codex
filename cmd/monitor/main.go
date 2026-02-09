@@ -67,7 +67,7 @@ func main() {
 	tasksTable := tview.NewTable().
 		SetBorders(false).
 		SetSelectable(true, false)
-	tasksTable.SetTitle("Tasks (Enter to inspect, q to quit, r refresh)").SetBorder(true)
+	tasksTable.SetTitle("Tasks (Enter inspect, F5 refresh, F10 quit)").SetBorder(true)
 
 	messagesView := tview.NewTextView().
 		SetDynamicColors(true).
