@@ -83,7 +83,7 @@ func main() {
 	decisionsView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetWrap(false)
-	decisionsView.SetTitle("Decisions").SetBorder(true)
+	decisionsView.SetTitle("Timeline").SetBorder(true)
 
 	agentStateView := tview.NewTextView().
 		SetDynamicColors(true).
@@ -177,10 +177,15 @@ func main() {
 				items []domain.DecisionLog
 				err   error
 			}
+			type timelineResult struct {
+				items []domain.TimelineEvent
+				err   error
+			}
 
 			msgCh := make(chan msgResult, 1)
 			ackCh := make(chan ackResult, 1)
 			decisionCh := make(chan decisionResult, 1)
+			timelineCh := make(chan timelineResult, 1)
 
 			go func() {
 				items, err := c.listTaskMessages(selected, 200)
@@ -194,10 +199,15 @@ func main() {
 				items, err := c.listTaskDecisions(selected, 250)
 				decisionCh <- decisionResult{items: items, err: err}
 			}()
+			go func() {
+				items, err := c.listTaskTimeline(selected, 500)
+				timelineCh <- timelineResult{items: items, err: err}
+			}()
 
 			msgRes := <-msgCh
 			ackRes := <-ackCh
 			decisionRes := <-decisionCh
+			timelineRes := <-timelineCh
 
 			if atomic.LoadUint64(&detailsVersion) != v {
 				return
@@ -216,10 +226,10 @@ func main() {
 				} else {
 					acksView.SetText(renderAcks(ackRes.items))
 				}
-				if decisionRes.err != nil {
-					decisionsView.SetText(fmt.Sprintf("error: %v", decisionRes.err))
+				if timelineRes.err != nil {
+					decisionsView.SetText(fmt.Sprintf("error: %v", timelineRes.err))
 				} else {
-					decisionsView.SetText(renderDecisions(decisionRes.items))
+					decisionsView.SetText(renderTimeline(timelineRes.items))
 				}
 				agentStateView.SetText(renderAgentState(selected, lastTasks, msgRes.items, ackRes.items, decisionRes.items))
 			})
@@ -491,6 +501,56 @@ func renderDecisions(items []domain.DecisionLog) string {
 	return b.String()
 }
 
+func renderTimeline(items []domain.TimelineEvent) string {
+	if len(items) == 0 {
+		return "No timeline events"
+	}
+	var b strings.Builder
+	for _, item := range items {
+		ts := item.CreatedAt.Format("15:04:05")
+		switch item.Kind {
+		case "message":
+			b.WriteString(fmt.Sprintf(
+				"[%s] msg %s -> %s %s status=%s\n",
+				ts,
+				trimLine(item.FromAgent, 18),
+				trimLine(item.ToAgent, 18),
+				trimLine(item.Type, 16),
+				trimLine(item.Status, 16),
+			))
+			if item.Reason != "" {
+				b.WriteString("  reason: " + trimLine(item.Reason, 120) + "\n")
+			}
+		case "ack":
+			b.WriteString(fmt.Sprintf(
+				"[%s] ack %s msg=%s\n",
+				ts,
+				trimLine(item.Actor, 18),
+				shortID(item.RefID),
+			))
+			if item.Result != "" {
+				b.WriteString("  result: " + trimLine(item.Result, 120) + "\n")
+			}
+		case "decision":
+			b.WriteString(fmt.Sprintf(
+				"[%s] dec %s %s\n",
+				ts,
+				trimLine(item.Actor, 18),
+				trimLine(item.Action, 40),
+			))
+			if item.Reason != "" {
+				b.WriteString("  reason: " + trimLine(item.Reason, 120) + "\n")
+			}
+			if detail := decisionPayloadSummary(item.Payload); detail != "" {
+				b.WriteString("  payload: " + trimLine(detail, 160) + "\n")
+			}
+		default:
+			b.WriteString(fmt.Sprintf("[%s] %s %s\n", ts, trimLine(item.Kind, 16), shortID(item.RefID)))
+		}
+	}
+	return b.String()
+}
+
 type agentStateLine struct {
 	Agent      string
 	State      string
@@ -523,6 +583,7 @@ func renderAgentState(
 	lines := map[string]*agentStateLine{
 		"planner":      {Agent: "planner", State: "idle"},
 		"coder":        {Agent: "coder", State: "idle"},
+		"reviewer":     {Agent: "reviewer", State: "idle"},
 		"orchestrator": {Agent: "orchestrator", State: "idle"},
 	}
 
@@ -573,7 +634,7 @@ func renderAgentState(
 		line.LastAck = trimLine(ack.Result, 64)
 	}
 
-	order := []string{"orchestrator", "planner", "coder"}
+	order := []string{"orchestrator", "planner", "coder", "reviewer"}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Task: %s  status=%s\n", shortID(taskID), taskStatus))
 	for _, id := range order {
@@ -613,11 +674,22 @@ func classifyAgentState(actor, action, taskStatus string) string {
 		}
 	case "planner":
 		switch action {
-		case "forwarded_to_coder", "message_received":
+		case "plan_proposed", "message_received":
 			return "coordinating"
-		case "notified_orchestrator_done":
+		case "plan_registered":
 			return "done"
-		case "forward_failed", "notify_orchestrator_failed":
+		case "plan_propose_failed":
+			return "error"
+		default:
+			return "idle"
+		}
+	case "reviewer":
+		switch action {
+		case "message_received":
+			return "reviewing"
+		case "done_sent":
+			return "done"
+		case "review_failed", "done_send_failed":
 			return "error"
 		default:
 			return "idle"
@@ -691,10 +763,9 @@ func (c *client) createAndStartTaskFromPrompt(prompt string) (string, error) {
 	}
 
 	channels := []map[string]any{
-		{"from_agent": "planner", "to_agent": "coder", "allowed_types": []string{"REQUEST"}, "max_msgs": 40, "ttl_seconds": 7200},
-		{"from_agent": "coder", "to_agent": "planner", "allowed_types": []string{"DONE"}, "max_msgs": 40, "ttl_seconds": 7200},
-		{"from_agent": "planner", "to_agent": "orchestrator", "allowed_types": []string{"DONE", "ESCALATE"}, "max_msgs": 40, "ttl_seconds": 7200},
-		{"from_agent": "coder", "to_agent": "orchestrator", "allowed_types": []string{"BLOCKED"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "planner", "to_agent": "orchestrator", "allowed_types": []string{"PROPOSE", "ESCALATE"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "coder", "to_agent": "orchestrator", "allowed_types": []string{"DONE", "BLOCKED"}, "max_msgs": 40, "ttl_seconds": 7200},
+		{"from_agent": "reviewer", "to_agent": "orchestrator", "allowed_types": []string{"DONE", "BLOCKED"}, "max_msgs": 40, "ttl_seconds": 7200},
 	}
 	for _, ch := range channels {
 		if err := c.postJSON(fmt.Sprintf("/tasks/%s/channels", task.ID), ch, nil); err != nil {
@@ -735,6 +806,14 @@ func (c *client) listTaskAcks(taskID string, limit int) ([]domain.MessageAck, er
 func (c *client) listTaskDecisions(taskID string, limit int) ([]domain.DecisionLog, error) {
 	var out []domain.DecisionLog
 	if err := c.getJSON(fmt.Sprintf("/tasks/%s/decisions?limit=%d", taskID, limit), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *client) listTaskTimeline(taskID string, limit int) ([]domain.TimelineEvent, error) {
+	var out []domain.TimelineEvent
+	if err := c.getJSON(fmt.Sprintf("/tasks/%s/timeline?limit=%d", taskID, limit), &out); err != nil {
 		return nil, err
 	}
 	return out, nil

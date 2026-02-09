@@ -437,87 +437,12 @@ func (s *Store) CanSendMessage(
 		return true, "orchestrator privileged sender", nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	channelID, denyReason, err := s.findEligibleChannel(ctx, taskID, fromAgent, toAgent, msgType, now)
 	if err != nil {
-		return false, "", fmt.Errorf("begin tx can send message: %w", err)
+		return false, "", err
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	rows, err := tx.QueryContext(
-		ctx,
-		`SELECT id, allowed_types, max_msgs, sent_msgs, expires_at
-		FROM agent_channels
-		WHERE task_id = ? AND from_agent = ? AND to_agent = ?`,
-		taskID, fromAgent, toAgent,
-	)
-	if err != nil {
-		return false, "", fmt.Errorf("query channels: %w", err)
-	}
-	defer rows.Close()
-
-	var selectedID int64
-	var denyReason string
-	for rows.Next() {
-		var channelID int64
-		var allowedTypesRaw string
-		var maxMsgs int
-		var sentMsgs int
-		var expires sql.NullInt64
-		if err := rows.Scan(&channelID, &allowedTypesRaw, &maxMsgs, &sentMsgs, &expires); err != nil {
-			return false, "", fmt.Errorf("scan channel: %w", err)
-		}
-		if expires.Valid && now.Unix() > expires.Int64 {
-			denyReason = "channel expired"
-			continue
-		}
-		allowedTypes, err := parseAllowedTypes(allowedTypesRaw)
-		if err != nil {
-			return false, "", fmt.Errorf("parse channel types: %w", err)
-		}
-		if !messageTypeAllowed(msgType, allowedTypes) {
-			denyReason = "message type is not allowed by channel"
-			continue
-		}
-		if maxMsgs > 0 && sentMsgs >= maxMsgs {
-			denyReason = "channel max messages reached"
-			continue
-		}
-		selectedID = channelID
-		break
-	}
-	if err := rows.Err(); err != nil {
-		return false, "", fmt.Errorf("iterate channels: %w", err)
-	}
-
-	if selectedID == 0 {
-		if denyReason == "" {
-			denyReason = "no matching channel"
-		}
+	if channelID == 0 {
 		return false, denyReason, nil
-	}
-
-	res, err := tx.ExecContext(
-		ctx,
-		`UPDATE agent_channels
-		SET sent_msgs = sent_msgs + 1
-		WHERE id = ? AND (max_msgs = 0 OR sent_msgs < max_msgs)`,
-		selectedID,
-	)
-	if err != nil {
-		return false, "", fmt.Errorf("increment channel usage: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, "", fmt.Errorf("channel usage affected rows: %w", err)
-	}
-	if affected == 0 {
-		return false, "channel max messages reached", nil
-	}
-
-	if err := tx.Commit(); err != nil {
-		return false, "", fmt.Errorf("commit can send message: %w", err)
 	}
 	return true, "allowed", nil
 }
@@ -530,6 +455,37 @@ func (s *Store) CreateMessage(ctx context.Context, msg domain.Message) (bool, er
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	var taskStatus string
+	var maxHops int
+	var hopCount int
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT status, max_hops, hop_count FROM tasks WHERE id = ?`,
+		msg.TaskID,
+	).Scan(&taskStatus, &maxHops, &hopCount); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("task not found: %s", msg.TaskID)
+		}
+		return false, fmt.Errorf("get task for message create: %w", err)
+	}
+	if taskStatus == string(domain.TaskStatusDone) ||
+		taskStatus == string(domain.TaskStatusFailed) ||
+		taskStatus == string(domain.TaskStatusCanceled) {
+		return false, fmt.Errorf("task %s is final state (%s), no new messages accepted", msg.TaskID, taskStatus)
+	}
+
+	channelID := int64(0)
+	if msg.FromAgent != "orchestrator" {
+		var denyReason string
+		channelID, denyReason, err = s.findEligibleChannelTx(ctx, tx, msg.TaskID, msg.FromAgent, msg.ToAgent, msg.Type, time.Now().UTC())
+		if err != nil {
+			return false, err
+		}
+		if channelID == 0 {
+			return false, fmt.Errorf("message denied: %s", denyReason)
+		}
+	}
 
 	res, err := tx.ExecContext(
 		ctx,
@@ -546,6 +502,42 @@ func (s *Store) CreateMessage(ctx context.Context, msg domain.Message) (bool, er
 	}
 	if affected == 0 {
 		return false, nil
+	}
+
+	if msg.FromAgent != "orchestrator" {
+		nextHop := hopCount + 1
+		if maxHops <= 0 {
+			maxHops = 8
+		}
+		if nextHop > maxHops {
+			return false, fmt.Errorf("max hops exceeded for task %s", msg.TaskID)
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			`UPDATE tasks SET hop_count = hop_count + 1, updated_at = ? WHERE id = ?`,
+			time.Now().UTC().Unix(),
+			msg.TaskID,
+		); err != nil {
+			return false, fmt.Errorf("increment task hop: %w", err)
+		}
+
+		res, err := tx.ExecContext(
+			ctx,
+			`UPDATE agent_channels
+			SET sent_msgs = sent_msgs + 1
+			WHERE id = ? AND (max_msgs = 0 OR sent_msgs < max_msgs)`,
+			channelID,
+		)
+		if err != nil {
+			return false, fmt.Errorf("increment channel usage: %w", err)
+		}
+		channelAffected, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("channel usage affected rows: %w", err)
+		}
+		if channelAffected == 0 {
+			return false, fmt.Errorf("message denied: channel max messages reached")
+		}
 	}
 
 	_, err = tx.ExecContext(
@@ -617,18 +609,56 @@ func (s *Store) ListDispatchableMessages(ctx context.Context, limit int, now tim
 	return result, nil
 }
 
-func (s *Store) MarkMessageDelivered(ctx context.Context, messageID string) error {
-	_, err := s.db.ExecContext(
+func (s *Store) ClaimMessageForDispatch(ctx context.Context, messageID string, now, leaseUntil time.Time) (bool, error) {
+	res, err := s.db.ExecContext(
 		ctx,
 		`UPDATE agent_messages
-		SET status = ?, last_error = ''
-		WHERE id = ?`,
-		string(domain.MessageStatusDelivered), messageID,
+		SET status = ?, next_attempt_at = ?, last_error = ''
+		WHERE id = ? AND status = ? AND next_attempt_at <= ?`,
+		string(domain.MessageStatusDispatching),
+		leaseUntil.Unix(),
+		messageID,
+		string(domain.MessageStatusPending),
+		now.Unix(),
 	)
 	if err != nil {
-		return fmt.Errorf("mark message delivered: %w", err)
+		return false, fmt.Errorf("claim message for dispatch: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim message rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
+
+func (s *Store) MarkMessageDelivered(ctx context.Context, messageID string, ackDeadline time.Time) (bool, error) {
+	res, err := s.db.ExecContext(
+		ctx,
+		`UPDATE agent_messages
+		SET status = ?, next_attempt_at = ?, last_error = ''
+		WHERE id = ? AND status = ?`,
+		string(domain.MessageStatusDelivered), ackDeadline.Unix(), messageID, string(domain.MessageStatusDispatching),
+	)
+	if err != nil {
+		return false, fmt.Errorf("mark message delivered: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mark delivered rows affected: %w", err)
+	}
+	if affected > 0 {
+		if _, err := s.db.ExecContext(
+			ctx,
+			`UPDATE tasks
+			SET updated_at = ?
+			WHERE id = (SELECT task_id FROM agent_messages WHERE id = ?)`,
+			time.Now().UTC().Unix(),
+			messageID,
+		); err != nil {
+			return false, fmt.Errorf("touch task on delivered: %w", err)
+		}
+	}
+	return affected > 0, nil
 }
 
 func (s *Store) MarkMessageForRetry(ctx context.Context, messageID string, lastError string, retryAt time.Time, maxRetries int) (bool, error) {
@@ -641,11 +671,18 @@ func (s *Store) MarkMessageForRetry(ctx context.Context, messageID string, lastE
 	}()
 
 	var attempts int
-	if err := tx.QueryRowContext(ctx, `SELECT attempts FROM agent_messages WHERE id = ?`, messageID).Scan(&attempts); err != nil {
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT attempts, status FROM agent_messages WHERE id = ?`, messageID).Scan(&attempts, &status); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, fmt.Errorf("message not found: %s", messageID)
 		}
 		return false, fmt.Errorf("get message attempts: %w", err)
+	}
+	if status == string(domain.MessageStatusAcked) || status == string(domain.MessageStatusFailed) {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit message retry noop: %w", err)
+		}
+		return false, nil
 	}
 
 	nextAttempts := attempts + 1
@@ -656,6 +693,16 @@ func (s *Store) MarkMessageForRetry(ctx context.Context, messageID string, lastE
 			string(domain.MessageStatusFailed), nextAttempts, lastError, messageID,
 		); err != nil {
 			return false, fmt.Errorf("mark message failed after retries: %w", err)
+		}
+		if _, err := tx.ExecContext(
+			ctx,
+			`UPDATE tasks
+			SET updated_at = ?
+			WHERE id = (SELECT task_id FROM agent_messages WHERE id = ?)`,
+			time.Now().UTC().Unix(),
+			messageID,
+		); err != nil {
+			return false, fmt.Errorf("touch task on message fail: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit message fail: %w", err)
@@ -671,6 +718,16 @@ func (s *Store) MarkMessageForRetry(ctx context.Context, messageID string, lastE
 		string(domain.MessageStatusPending), nextAttempts, retryAt.Unix(), lastError, messageID,
 	); err != nil {
 		return false, fmt.Errorf("schedule message retry: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE tasks
+		SET updated_at = ?
+		WHERE id = (SELECT task_id FROM agent_messages WHERE id = ?)`,
+		time.Now().UTC().Unix(),
+		messageID,
+	); err != nil {
+		return false, fmt.Errorf("touch task on message retry: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -688,6 +745,21 @@ func (s *Store) AckMessage(ctx context.Context, messageID string, agentID string
 		_ = tx.Rollback()
 	}()
 
+	var toAgent string
+	if err := tx.QueryRowContext(
+		ctx,
+		`SELECT to_agent FROM agent_messages WHERE id = ?`,
+		messageID,
+	).Scan(&toAgent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("ack message: message not found: %s", messageID)
+		}
+		return fmt.Errorf("ack message read receiver: %w", err)
+	}
+	if toAgent != agentID {
+		return fmt.Errorf("ack message denied: agent %s is not receiver %s", agentID, toAgent)
+	}
+
 	_, err = tx.ExecContext(
 		ctx,
 		`INSERT OR IGNORE INTO message_acks(message_id, agent_id, result, ack_at)
@@ -696,6 +768,18 @@ func (s *Store) AckMessage(ctx context.Context, messageID string, agentID string
 	)
 	if err != nil {
 		return fmt.Errorf("ack message: %w", err)
+	}
+	_, err = tx.ExecContext(
+		ctx,
+		`UPDATE agent_messages
+		SET status = ?, last_error = ''
+		WHERE id = ? AND status != ?`,
+		string(domain.MessageStatusAcked),
+		messageID,
+		string(domain.MessageStatusFailed),
+	)
+	if err != nil {
+		return fmt.Errorf("mark message acked: %w", err)
 	}
 
 	_, err = tx.ExecContext(
@@ -713,6 +797,60 @@ func (s *Store) AckMessage(ctx context.Context, messageID string, agentID string
 		return fmt.Errorf("commit ack message: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) ListExpiredInFlightMessages(ctx context.Context, limit int, now time.Time) ([]domain.Message, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT m.id, m.task_id, m.from_agent, m.to_agent, m.type, m.payload, m.correlation_id, m.idempotency_key,
+			m.status, m.attempts, m.next_attempt_at, m.last_error, m.created_at
+		FROM agent_messages m
+		LEFT JOIN message_acks a
+			ON a.message_id = m.id
+			AND a.agent_id = m.to_agent
+		WHERE m.status IN (?, ?)
+			AND m.next_attempt_at <= ?
+			AND a.id IS NULL
+		ORDER BY m.next_attempt_at ASC, m.created_at ASC
+		LIMIT ?`,
+		string(domain.MessageStatusDispatching),
+		string(domain.MessageStatusDelivered),
+		now.Unix(),
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list expired in-flight messages: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]domain.Message, 0, limit)
+	for rows.Next() {
+		var m domain.Message
+		var typ string
+		var status string
+		var nextAttempt int64
+		var created int64
+		var payload string
+		if err := rows.Scan(
+			&m.ID, &m.TaskID, &m.FromAgent, &m.ToAgent, &typ, &payload, &m.CorrelationID, &m.IdempotencyKey,
+			&status, &m.Attempts, &nextAttempt, &m.LastError, &created,
+		); err != nil {
+			return nil, fmt.Errorf("scan expired in-flight message: %w", err)
+		}
+		m.Type = domain.MessageType(typ)
+		m.Payload = []byte(payload)
+		m.Status = domain.MessageStatus(status)
+		m.NextAttemptAt = unixToTime(nextAttempt)
+		m.CreatedAt = unixToTime(created)
+		result = append(result, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate expired in-flight messages: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Store) CreateArtifact(ctx context.Context, artifact domain.Artifact) error {
@@ -795,10 +933,12 @@ func (s *Store) CountActiveMessages(ctx context.Context, taskID string) (int, er
 		WHERE m.task_id = ?
 			AND (
 				m.status = ?
+				OR m.status = ?
 				OR (m.status = ? AND a.id IS NULL)
 			)`,
 		taskID,
 		string(domain.MessageStatusPending),
+		string(domain.MessageStatusDispatching),
 		string(domain.MessageStatusDelivered),
 	)
 	var count int
@@ -925,6 +1065,107 @@ func (s *Store) ListTaskDecisions(ctx context.Context, taskID string, limit int)
 	return result, nil
 }
 
+func (s *Store) ListTaskTimeline(ctx context.Context, taskID string, limit int) ([]domain.TimelineEvent, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT kind, task_id, ref_id, actor, from_agent, to_agent, type, status, action, reason, result, payload, created_at
+		FROM (
+			SELECT
+				'message' AS kind,
+				m.task_id AS task_id,
+				m.id AS ref_id,
+				'' AS actor,
+				m.from_agent AS from_agent,
+				m.to_agent AS to_agent,
+				m.type AS type,
+				m.status AS status,
+				'' AS action,
+				m.last_error AS reason,
+				'' AS result,
+				m.payload AS payload,
+				m.created_at AS created_at
+			FROM agent_messages m
+			WHERE m.task_id = ?
+			UNION ALL
+			SELECT
+				'ack' AS kind,
+				m.task_id AS task_id,
+				a.message_id AS ref_id,
+				a.agent_id AS actor,
+				'' AS from_agent,
+				'' AS to_agent,
+				'' AS type,
+				'' AS status,
+				'' AS action,
+				'' AS reason,
+				a.result AS result,
+				'{}' AS payload,
+				a.ack_at AS created_at
+			FROM message_acks a
+			JOIN agent_messages m ON m.id = a.message_id
+			WHERE m.task_id = ?
+			UNION ALL
+			SELECT
+				'decision' AS kind,
+				d.task_id AS task_id,
+				CAST(d.id AS TEXT) AS ref_id,
+				d.actor AS actor,
+				'' AS from_agent,
+				'' AS to_agent,
+				'' AS type,
+				'' AS status,
+				d.action AS action,
+				d.reason AS reason,
+				'' AS result,
+				d.payload AS payload,
+				d.created_at AS created_at
+			FROM decision_log d
+			WHERE d.task_id = ?
+		) timeline
+		ORDER BY created_at DESC
+		LIMIT ?`,
+		taskID, taskID, taskID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list task timeline: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]domain.TimelineEvent, 0, limit)
+	for rows.Next() {
+		var item domain.TimelineEvent
+		var payload string
+		var createdAt int64
+		if err := rows.Scan(
+			&item.Kind,
+			&item.TaskID,
+			&item.RefID,
+			&item.Actor,
+			&item.FromAgent,
+			&item.ToAgent,
+			&item.Type,
+			&item.Status,
+			&item.Action,
+			&item.Reason,
+			&item.Result,
+			&payload,
+			&createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan timeline row: %w", err)
+		}
+		item.Payload = []byte(payload)
+		item.CreatedAt = unixToTime(createdAt)
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate timeline rows: %w", err)
+	}
+	return result, nil
+}
+
 func int64ToTimePtr(v sql.NullInt64) *time.Time {
 	if !v.Valid || v.Int64 <= 0 {
 		return nil
@@ -954,6 +1195,93 @@ func parseAllowedTypes(raw string) ([]domain.MessageType, error) {
 		result = append(result, domain.MessageType(v))
 	}
 	return result, nil
+}
+
+func (s *Store) findEligibleChannel(
+	ctx context.Context,
+	taskID string,
+	fromAgent string,
+	toAgent string,
+	msgType domain.MessageType,
+	now time.Time,
+) (int64, string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("begin tx can send message: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	channelID, denyReason, err := s.findEligibleChannelTx(ctx, tx, taskID, fromAgent, toAgent, msgType, now)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, "", fmt.Errorf("commit can send message: %w", err)
+	}
+	return channelID, denyReason, nil
+}
+
+func (s *Store) findEligibleChannelTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	taskID string,
+	fromAgent string,
+	toAgent string,
+	msgType domain.MessageType,
+	now time.Time,
+) (int64, string, error) {
+	rows, err := tx.QueryContext(
+		ctx,
+		`SELECT id, allowed_types, max_msgs, sent_msgs, expires_at
+		FROM agent_channels
+		WHERE task_id = ? AND from_agent = ? AND to_agent = ?
+		ORDER BY id ASC`,
+		taskID, fromAgent, toAgent,
+	)
+	if err != nil {
+		return 0, "", fmt.Errorf("query channels: %w", err)
+	}
+	defer rows.Close()
+
+	var selectedID int64
+	var denyReason string
+	for rows.Next() {
+		var channelID int64
+		var allowedTypesRaw string
+		var maxMsgs int
+		var sentMsgs int
+		var expires sql.NullInt64
+		if err := rows.Scan(&channelID, &allowedTypesRaw, &maxMsgs, &sentMsgs, &expires); err != nil {
+			return 0, "", fmt.Errorf("scan channel: %w", err)
+		}
+		if expires.Valid && now.Unix() > expires.Int64 {
+			denyReason = "channel expired"
+			continue
+		}
+		allowedTypes, err := parseAllowedTypes(allowedTypesRaw)
+		if err != nil {
+			return 0, "", fmt.Errorf("parse channel types: %w", err)
+		}
+		if !messageTypeAllowed(msgType, allowedTypes) {
+			denyReason = "message type is not allowed by channel"
+			continue
+		}
+		if maxMsgs > 0 && sentMsgs >= maxMsgs {
+			denyReason = "channel max messages reached"
+			continue
+		}
+		selectedID = channelID
+		break
+	}
+	if err := rows.Err(); err != nil {
+		return 0, "", fmt.Errorf("iterate channels: %w", err)
+	}
+	if selectedID == 0 && denyReason == "" {
+		denyReason = "no matching channel"
+	}
+	return selectedID, denyReason, nil
 }
 
 func messageTypeAllowed(msgType domain.MessageType, allowed []domain.MessageType) bool {

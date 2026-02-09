@@ -81,6 +81,8 @@ func main() {
 
 	orchCfg := orchestrator.Config{
 		DispatchInterval: durationMS(cfg.Orchestrator.DispatchIntervalMS, 250*time.Millisecond),
+		DispatchLease:    durationMS(cfg.Orchestrator.DispatchLeaseMS, 10*time.Second),
+		AckTimeout:       durationMS(cfg.Orchestrator.AckTimeoutMS, 45*time.Second),
 		WatchdogInterval: durationMS(cfg.Orchestrator.WatchdogIntervalMS, 3*time.Second),
 		RetryDelay:       durationMS(cfg.Orchestrator.RetryDelayMS, 1*time.Second),
 		MaxRetries:       intOrDefault(cfg.Orchestrator.MaxRetries, 6),
@@ -92,8 +94,10 @@ func main() {
 
 	planner := agent.NewPlanner(bus, orch, store, log.Default())
 	coder := agent.NewCoder(bus, orch, store, files, "codex", workspaceRoot, log.Default())
+	reviewer := agent.NewReviewer(bus, orch, store, log.Default())
 	planner.Start(ctx)
 	coder.Start(ctx)
+	reviewer.Start(ctx)
 
 	if *demo {
 		if err := bootstrapDemo(ctx, orch); err != nil {
@@ -362,6 +366,18 @@ func (a *app) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, items)
+	case "timeline":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		limit := queryInt(r, "limit", 500)
+		items, err := a.orchestrator.ListTaskTimeline(r.Context(), taskID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown action: %s", action))
 	}
@@ -370,7 +386,7 @@ func (a *app) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 func bootstrapDemo(ctx context.Context, orch *orchestrator.Service) error {
 	task, err := orch.CreateTask(ctx, orchestrator.CreateTaskInput{
 		Goal:         "Build initial orchestrator draft",
-		Scope:        "Use planner and coder with direct messaging",
+		Scope:        "Use planner to produce a plan, coder to implement, reviewer to validate",
 		OwnerAgent:   "planner",
 		BudgetTokens: 5000,
 		MaxHops:      10,
@@ -408,24 +424,8 @@ func bootstrapDemo(ctx context.Context, orch *orchestrator.Service) error {
 		{
 			TaskID:       task.ID,
 			FromAgent:    "planner",
-			ToAgent:      "coder",
-			AllowedTypes: []domain.MessageType{domain.MessageTypeRequest},
-			MaxMsgs:      20,
-			ExpiresAt:    &expires,
-		},
-		{
-			TaskID:       task.ID,
-			FromAgent:    "coder",
-			ToAgent:      "planner",
-			AllowedTypes: []domain.MessageType{domain.MessageTypeDone},
-			MaxMsgs:      20,
-			ExpiresAt:    &expires,
-		},
-		{
-			TaskID:       task.ID,
-			FromAgent:    "planner",
 			ToAgent:      "orchestrator",
-			AllowedTypes: []domain.MessageType{domain.MessageTypeDone, domain.MessageTypeEscalate},
+			AllowedTypes: []domain.MessageType{domain.MessageTypePropose, domain.MessageTypeEscalate},
 			MaxMsgs:      20,
 			ExpiresAt:    &expires,
 		},
@@ -433,7 +433,15 @@ func bootstrapDemo(ctx context.Context, orch *orchestrator.Service) error {
 			TaskID:       task.ID,
 			FromAgent:    "coder",
 			ToAgent:      "orchestrator",
-			AllowedTypes: []domain.MessageType{domain.MessageTypeBlocked},
+			AllowedTypes: []domain.MessageType{domain.MessageTypeDone, domain.MessageTypeBlocked},
+			MaxMsgs:      20,
+			ExpiresAt:    &expires,
+		},
+		{
+			TaskID:       task.ID,
+			FromAgent:    "reviewer",
+			ToAgent:      "orchestrator",
+			AllowedTypes: []domain.MessageType{domain.MessageTypeDone, domain.MessageTypeBlocked},
 			MaxMsgs:      20,
 			ExpiresAt:    &expires,
 		},

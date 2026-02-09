@@ -30,9 +30,11 @@ const (
 type MessageStatus string
 
 const (
-	MessageStatusPending   MessageStatus = "pending"
-	MessageStatusDelivered MessageStatus = "delivered"
-	MessageStatusFailed    MessageStatus = "failed"
+	MessageStatusPending     MessageStatus = "pending"
+	MessageStatusDispatching MessageStatus = "dispatching"
+	MessageStatusDelivered   MessageStatus = "delivered"
+	MessageStatusAcked       MessageStatus = "acked"
+	MessageStatusFailed      MessageStatus = "failed"
 )
 
 type PermissionEffect string
@@ -145,6 +147,22 @@ type MessageAck struct {
 	AckAt     time.Time `json:"ack_at"`
 }
 
+type TimelineEvent struct {
+	Kind      string          `json:"kind"`
+	TaskID    string          `json:"task_id"`
+	RefID     string          `json:"ref_id"`
+	Actor     string          `json:"actor,omitempty"`
+	FromAgent string          `json:"from_agent,omitempty"`
+	ToAgent   string          `json:"to_agent,omitempty"`
+	Type      string          `json:"type,omitempty"`
+	Status    string          `json:"status,omitempty"`
+	Action    string          `json:"action,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+	Result    string          `json:"result,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
 type TaskRequestPayload struct {
 	Goal               string   `json:"goal"`
 	Scope              string   `json:"scope"`
@@ -153,6 +171,7 @@ type TaskRequestPayload struct {
 }
 
 type WorkRequestPayload struct {
+	NodeID             string   `json:"node_id,omitempty"`
 	Goal               string   `json:"goal"`
 	Scope              string   `json:"scope"`
 	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
@@ -160,6 +179,27 @@ type WorkRequestPayload struct {
 }
 
 type WorkResultPayload struct {
+	NodeID       string   `json:"node_id,omitempty"`
 	Summary      string   `json:"summary"`
 	CreatedFiles []string `json:"created_files,omitempty"`
+}
+
+type PlanProposalPayload struct {
+	Summary string     `json:"summary,omitempty"`
+	Nodes   []PlanNode `json:"nodes"`
+}
+
+type PlanNode struct {
+	ID        string      `json:"id"`
+	AgentID   string      `json:"agent_id"`
+	Type      MessageType `json:"type"`
+	Goal      string      `json:"goal,omitempty"`
+	Scope     string      `json:"scope,omitempty"`
+	DependsOn []string    `json:"depends_on,omitempty"`
+}
+
+type ReviewRequestPayload struct {
+	NodeID       string   `json:"node_id"`
+	Summary      string   `json:"summary"`
+	CreatedFiles []string `json:"created_files"`
 }

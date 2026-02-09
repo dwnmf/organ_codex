@@ -105,66 +105,45 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 			_ = p.store.AckMessage(ctx, msg.ID, p.id, "bad payload")
 			return
 		}
-		workReq := domain.WorkRequestPayload{
-			Goal:               req.Goal,
-			Scope:              req.Scope,
-			AcceptanceCriteria: req.AcceptanceCriteria,
-			TargetPaths:        req.TargetPaths,
+		plan := domain.PlanProposalPayload{
+			Summary: "two-step execution plan: implement then review",
+			Nodes: []domain.PlanNode{
+				{
+					ID:      "implement",
+					AgentID: "coder",
+					Type:    domain.MessageTypeRequest,
+					Goal:    req.Goal,
+					Scope:   req.Scope,
+				},
+				{
+					ID:        "review",
+					AgentID:   "reviewer",
+					Type:      domain.MessageTypeReview,
+					DependsOn: []string{"implement"},
+				},
+			},
 		}
-		payload, _ := json.Marshal(workReq)
-		err := p.messenger.EnqueueMessage(ctx, domain.Message{
-			TaskID:         msg.TaskID,
-			FromAgent:      p.id,
-			ToAgent:        "coder",
-			Type:           domain.MessageTypeRequest,
-			Payload:        payload,
-			CorrelationID:  msg.CorrelationID,
-			IdempotencyKey: "planner-request-" + msg.ID,
-		})
-		result := "forwarded to coder"
-		if err != nil {
-			result = "failed to forward to coder: " + err.Error()
-			p.logger.Printf("planner enqueue to coder failed: %v", err)
-			logAction(ctx, p.store, msg.TaskID, p.id, "forward_failed", "planner failed to forward request to coder", map[string]any{
-				"error": err.Error(),
-			})
-		} else {
-			logAction(ctx, p.store, msg.TaskID, p.id, "forwarded_to_coder", "planner forwarded request to coder", map[string]any{
-				"correlation_id": msg.CorrelationID,
-			})
-		}
-		_ = p.store.AckMessage(ctx, msg.ID, p.id, result)
-	case domain.MessageTypeDone:
-		var res domain.WorkResultPayload
-		if err := json.Unmarshal(msg.Payload, &res); err != nil {
-			p.logger.Printf("planner parse done failed: %v", err)
-			logAction(ctx, p.store, msg.TaskID, p.id, "message_parse_failed", "planner failed to parse done payload", map[string]any{
-				"error": err.Error(),
-			})
-			_ = p.store.AckMessage(ctx, msg.ID, p.id, "bad payload")
-			return
-		}
-		finalPayload, _ := json.Marshal(res)
+		payload, _ := json.Marshal(plan)
 		err := p.messenger.EnqueueMessage(ctx, domain.Message{
 			TaskID:         msg.TaskID,
 			FromAgent:      p.id,
 			ToAgent:        "orchestrator",
-			Type:           domain.MessageTypeDone,
-			Payload:        finalPayload,
+			Type:           domain.MessageTypePropose,
+			Payload:        payload,
 			CorrelationID:  msg.CorrelationID,
-			IdempotencyKey: "planner-done-" + msg.ID,
+			IdempotencyKey: "planner-propose-" + msg.ID,
 		})
-		result := "task marked done"
+		result := "plan proposed to orchestrator"
 		if err != nil {
-			result = "failed to notify orchestrator: " + err.Error()
-			p.logger.Printf("planner notify done failed: %v", err)
-			logAction(ctx, p.store, msg.TaskID, p.id, "notify_orchestrator_failed", "planner failed to notify orchestrator", map[string]any{
+			result = "failed to propose plan: " + err.Error()
+			p.logger.Printf("planner propose plan failed: %v", err)
+			logAction(ctx, p.store, msg.TaskID, p.id, "plan_propose_failed", "planner failed to propose plan to orchestrator", map[string]any{
 				"error": err.Error(),
 			})
 		} else {
-			logAction(ctx, p.store, msg.TaskID, p.id, "notified_orchestrator_done", "planner sent DONE to orchestrator", map[string]any{
-				"created_files": res.CreatedFiles,
-				"summary":       trim(res.Summary, 160),
+			logAction(ctx, p.store, msg.TaskID, p.id, "plan_proposed", "planner proposed execution plan to orchestrator", map[string]any{
+				"nodes":          len(plan.Nodes),
+				"correlation_id": msg.CorrelationID,
 			})
 		}
 		_ = p.store.AckMessage(ctx, msg.ID, p.id, result)
@@ -190,6 +169,14 @@ type Coder struct {
 	codexBinary  string
 	codexWorkdir string
 	logger       *log.Logger
+}
+
+type Reviewer struct {
+	id        string
+	queue     MessageQueue
+	messenger Messenger
+	store     Store
+	logger    *log.Logger
 }
 
 func NewCoder(
@@ -219,6 +206,19 @@ func NewCoder(
 		codexBinary:  codexBinary,
 		codexWorkdir: codexWorkdir,
 		logger:       logger,
+	}
+}
+
+func NewReviewer(queue MessageQueue, messenger Messenger, store Store, logger *log.Logger) *Reviewer {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Reviewer{
+		id:        "reviewer",
+		queue:     queue,
+		messenger: messenger,
+		store:     store,
+		logger:    logger,
 	}
 }
 
@@ -280,7 +280,8 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				"error": err.Error(),
 			})
 			payload := mustJSON(map[string]string{
-				"reason": "codex generation failed: " + err.Error(),
+				"reason":  "codex generation failed: " + err.Error(),
+				"node_id": req.NodeID,
 			})
 			_ = c.messenger.EnqueueMessage(ctx, domain.Message{
 				TaskID:         msg.TaskID,
@@ -298,7 +299,8 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 		if len(plan.Files) == 0 {
 			logAction(ctx, c.store, msg.TaskID, c.id, "codex_empty_plan", "codex returned empty file list", nil)
 			payload := mustJSON(map[string]string{
-				"reason": "codex returned empty file list",
+				"reason":  "codex returned empty file list",
+				"node_id": req.NodeID,
 			})
 			_ = c.messenger.EnqueueMessage(ctx, domain.Message{
 				TaskID:         msg.TaskID,
@@ -366,7 +368,8 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 		if len(createdFiles) == 0 {
 			logAction(ctx, c.store, msg.TaskID, c.id, "no_files_created", "all generated files failed validation/write", nil)
 			payload := mustJSON(map[string]string{
-				"reason": "no files were created (policy denied or invalid paths)",
+				"reason":  "no files were created (policy denied or invalid paths)",
+				"node_id": req.NodeID,
 			})
 			_ = c.messenger.EnqueueMessage(ctx, domain.Message{
 				TaskID:         msg.TaskID,
@@ -382,26 +385,28 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 		}
 
 		donePayload, _ := json.Marshal(domain.WorkResultPayload{
+			NodeID:       req.NodeID,
 			Summary:      plan.Summary,
 			CreatedFiles: createdFiles,
 		})
 		if err := c.messenger.EnqueueMessage(ctx, domain.Message{
 			TaskID:         msg.TaskID,
 			FromAgent:      c.id,
-			ToAgent:        "planner",
+			ToAgent:        "orchestrator",
 			Type:           domain.MessageTypeDone,
 			Payload:        donePayload,
 			CorrelationID:  msg.CorrelationID,
 			IdempotencyKey: "coder-done-" + msg.ID,
 		}); err != nil {
 			c.logger.Printf("coder send done failed: %v", err)
-			logAction(ctx, c.store, msg.TaskID, c.id, "done_send_failed", "failed to send DONE to planner", map[string]any{
+			logAction(ctx, c.store, msg.TaskID, c.id, "done_send_failed", "failed to send DONE to orchestrator", map[string]any{
 				"error": err.Error(),
 			})
 		} else {
-			logAction(ctx, c.store, msg.TaskID, c.id, "done_sent", "coder sent DONE to planner", map[string]any{
+			logAction(ctx, c.store, msg.TaskID, c.id, "done_sent", "coder sent DONE to orchestrator", map[string]any{
 				"created_files_count": len(createdFiles),
 				"summary":             trim(plan.Summary, 160),
+				"node_id":             req.NodeID,
 			})
 		}
 		_ = c.store.AckMessage(ctx, msg.ID, c.id, fmt.Sprintf("completed, created %d files", len(createdFiles)))
@@ -410,6 +415,99 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 			"type": msg.Type,
 		})
 		_ = c.store.AckMessage(ctx, msg.ID, c.id, "coder ignored message type")
+	}
+}
+
+func (r *Reviewer) Start(ctx context.Context) {
+	ch := r.queue.Register(r.id)
+	go func() {
+		defer r.queue.Unregister(r.id)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				r.handleMessage(ctx, msg)
+			}
+		}
+	}()
+}
+
+func (r *Reviewer) handleMessage(ctx context.Context, msg domain.Message) {
+	logAction(ctx, r.store, msg.TaskID, r.id, "message_received", "reviewer received message", map[string]any{
+		"type":    msg.Type,
+		"from":    msg.FromAgent,
+		"to":      msg.ToAgent,
+		"message": msg.ID,
+	})
+
+	switch msg.Type {
+	case domain.MessageTypeReview:
+		var req domain.ReviewRequestPayload
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			_ = r.store.AckMessage(ctx, msg.ID, r.id, "bad payload")
+			logAction(ctx, r.store, msg.TaskID, r.id, "message_parse_failed", "reviewer failed to parse review payload", map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		if strings.TrimSpace(req.Summary) == "" || len(req.CreatedFiles) == 0 {
+			payload := mustJSON(map[string]string{
+				"reason":  "review failed: empty summary or file list",
+				"node_id": req.NodeID,
+			})
+			_ = r.messenger.EnqueueMessage(ctx, domain.Message{
+				TaskID:         msg.TaskID,
+				FromAgent:      r.id,
+				ToAgent:        "orchestrator",
+				Type:           domain.MessageTypeBlocked,
+				Payload:        payload,
+				CorrelationID:  msg.CorrelationID,
+				IdempotencyKey: "reviewer-blocked-" + msg.ID,
+			})
+			_ = r.store.AckMessage(ctx, msg.ID, r.id, "review failed")
+			logAction(ctx, r.store, msg.TaskID, r.id, "review_failed", "reviewer rejected result payload", map[string]any{
+				"node_id":     req.NodeID,
+				"summary_len": len(strings.TrimSpace(req.Summary)),
+				"files_count": len(req.CreatedFiles),
+			})
+			return
+		}
+
+		donePayload, _ := json.Marshal(domain.WorkResultPayload{
+			NodeID:       req.NodeID,
+			Summary:      "Review passed: generated artifacts validated",
+			CreatedFiles: req.CreatedFiles,
+		})
+		if err := r.messenger.EnqueueMessage(ctx, domain.Message{
+			TaskID:         msg.TaskID,
+			FromAgent:      r.id,
+			ToAgent:        "orchestrator",
+			Type:           domain.MessageTypeDone,
+			Payload:        donePayload,
+			CorrelationID:  msg.CorrelationID,
+			IdempotencyKey: "reviewer-done-" + msg.ID,
+		}); err != nil {
+			r.logger.Printf("reviewer send done failed: %v", err)
+			logAction(ctx, r.store, msg.TaskID, r.id, "done_send_failed", "reviewer failed to send DONE", map[string]any{
+				"error": err.Error(),
+			})
+			_ = r.store.AckMessage(ctx, msg.ID, r.id, "done send failed")
+			return
+		}
+		logAction(ctx, r.store, msg.TaskID, r.id, "done_sent", "reviewer approved and sent DONE", map[string]any{
+			"node_id":     req.NodeID,
+			"files_count": len(req.CreatedFiles),
+		})
+		_ = r.store.AckMessage(ctx, msg.ID, r.id, "review completed")
+	default:
+		_ = r.store.AckMessage(ctx, msg.ID, r.id, "reviewer ignored message type")
+		logAction(ctx, r.store, msg.TaskID, r.id, "message_ignored", "reviewer ignored unsupported message type", map[string]any{
+			"type": msg.Type,
+		})
 	}
 }
 

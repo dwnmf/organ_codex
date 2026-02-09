@@ -42,6 +42,8 @@ type OrchestratorRuntimeConfig struct {
 	DBPath             string `toml:"db_path"`
 	WorkspaceRoot      string `toml:"workspace_root"`
 	DispatchIntervalMS int    `toml:"dispatch_interval_ms"`
+	DispatchLeaseMS    int    `toml:"dispatch_lease_ms"`
+	AckTimeoutMS       int    `toml:"ack_timeout_ms"`
 	WatchdogIntervalMS int    `toml:"watchdog_interval_ms"`
 	RetryDelayMS       int    `toml:"retry_delay_ms"`
 	MaxRetries         int    `toml:"max_retries"`

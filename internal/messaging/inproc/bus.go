@@ -44,12 +44,10 @@ func (b *Bus) Unregister(agentID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	ch, ok := b.subs[agentID]
-	if !ok {
+	if _, ok := b.subs[agentID]; !ok {
 		return
 	}
 	delete(b.subs, agentID)
-	close(ch)
 }
 
 func (b *Bus) Publish(msg domain.Message) error {
