@@ -476,8 +476,36 @@ func renderDecisions(items []domain.DecisionLog) string {
 			d.Action,
 			trimLine(d.Reason, 100),
 		))
+		if detail := decisionPayloadSummary(d.Payload); detail != "" {
+			b.WriteString("  payload: " + trimLine(detail, 160) + "\n")
+		}
 	}
 	return b.String()
+}
+
+func decisionPayloadSummary(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" || trimmed == "{}" {
+		return ""
+	}
+
+	var kv map[string]any
+	if err := json.Unmarshal(payload, &kv); err == nil {
+		keys := make([]string, 0, len(kv))
+		for k := range kv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, kv[k]))
+		}
+		return strings.Join(parts, ", ")
+	}
+	return trimmed
 }
 
 func (c *client) createAndStartTaskFromPrompt(prompt string) (string, error) {
