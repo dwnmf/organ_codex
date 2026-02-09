@@ -1,0 +1,9 @@
+data/
+workspace/
+workspace_smoke/
+workspace_smoke2/
+
+*.db
+*.db-shm
+*.db-wal
+*.log
