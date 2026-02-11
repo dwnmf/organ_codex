@@ -54,6 +54,7 @@ default_max_hops = 8
 - `GET /tasks/{id}/messages`
 - `GET /tasks/{id}/acks`
 - `GET /tasks/{id}/decisions`
+- `GET /tasks/{id}/timeline`
 
 Пример:
 ```powershell
@@ -88,7 +89,12 @@ curl -Method Post -Uri http://localhost:8091/tasks -ContentType "application/jso
 - задачи и их статусы;
 - сообщения между агентами (`from -> to`, тип, статус, retry);
 - ack от каждого агента;
-- решения оркестратора (deny/blocked/done и причины).
+- единый timeline (messages + acks + decisions) в хронологии.
+
+## Runtime safeguards
+- Если `REQUEST` не доставляется после исчерпания retry, задача переводится в `blocked`.
+- `DONE` принимается только с валидным payload (`summary` и непустой `created_files`).
+- Поздние терминальные сообщения после финализации задачи логируются как `final_message_ignored` и не меняют итоговый статус.
 
 Хотите использовать только UI поверх уже запущенного оркестратора:
 
