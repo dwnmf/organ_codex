@@ -38,17 +38,24 @@ type ModelProvider struct {
 }
 
 type OrchestratorRuntimeConfig struct {
-	Addr               string `toml:"addr"`
-	DBPath             string `toml:"db_path"`
-	WorkspaceRoot      string `toml:"workspace_root"`
-	DispatchIntervalMS int    `toml:"dispatch_interval_ms"`
-	DispatchLeaseMS    int    `toml:"dispatch_lease_ms"`
-	AckTimeoutMS       int    `toml:"ack_timeout_ms"`
-	WatchdogIntervalMS int    `toml:"watchdog_interval_ms"`
-	RetryDelayMS       int    `toml:"retry_delay_ms"`
-	MaxRetries         int    `toml:"max_retries"`
-	IdleTimeoutMS      int    `toml:"idle_timeout_ms"`
-	DefaultMaxHops     int    `toml:"default_max_hops"`
+	Addr                    string `toml:"addr"`
+	DBPath                  string `toml:"db_path"`
+	WorkspaceRoot           string `toml:"workspace_root"`
+	DispatchIntervalMS      int    `toml:"dispatch_interval_ms"`
+	DispatchLeaseMS         int    `toml:"dispatch_lease_ms"`
+	AckTimeoutMS            int    `toml:"ack_timeout_ms"`
+	WatchdogIntervalMS      int    `toml:"watchdog_interval_ms"`
+	RetryDelayMS            int    `toml:"retry_delay_ms"`
+	MaxRetries              int    `toml:"max_retries"`
+	IdleTimeoutMS           int    `toml:"idle_timeout_ms"`
+	DefaultMaxHops          int    `toml:"default_max_hops"`
+	CoderBackend            string `toml:"coder_backend"`
+	CoderAPITimeoutMS       int    `toml:"coder_api_timeout_ms"`
+	CoderAPIRetries         int    `toml:"coder_api_retries"`
+	CoderAPIRetryBackoffMS  int    `toml:"coder_api_retry_backoff_ms"`
+	CoderAPIMaxOutputTokens int    `toml:"coder_api_max_output_tokens"`
+	CoderAPIMaxOutputBytes  int    `toml:"coder_api_max_output_bytes"`
+	CoderAPIAuthTokenEnv    string `toml:"coder_api_auth_token_env"`
 }
 
 func Load(path string) (Config, error) {

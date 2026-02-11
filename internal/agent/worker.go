@@ -5,10 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -45,6 +44,10 @@ type codexPlan struct {
 type codexFile struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+type PlanGenerator interface {
+	Generate(ctx context.Context, req domain.WorkRequestPayload) (codexPlan, error)
 }
 
 type Planner struct {
@@ -161,14 +164,13 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 }
 
 type Coder struct {
-	id           string
-	queue        MessageQueue
-	messenger    Messenger
-	store        Store
-	files        FileGateway
-	codexBinary  string
-	codexWorkdir string
-	logger       *log.Logger
+	id        string
+	queue     MessageQueue
+	messenger Messenger
+	store     Store
+	files     FileGateway
+	generator PlanGenerator
+	logger    *log.Logger
 }
 
 type Reviewer struct {
@@ -184,28 +186,23 @@ func NewCoder(
 	messenger Messenger,
 	store Store,
 	files FileGateway,
-	codexBinary string,
-	codexWorkdir string,
+	generator PlanGenerator,
 	logger *log.Logger,
 ) *Coder {
 	if logger == nil {
 		logger = log.Default()
 	}
-	if strings.TrimSpace(codexBinary) == "" {
-		codexBinary = "codex"
-	}
-	if strings.TrimSpace(codexWorkdir) == "" {
-		codexWorkdir = "."
+	if generator == nil {
+		generator = errorPlanGenerator{err: errors.New("plan generator is not configured")}
 	}
 	return &Coder{
-		id:           "coder",
-		queue:        queue,
-		messenger:    messenger,
-		store:        store,
-		files:        files,
-		codexBinary:  codexBinary,
-		codexWorkdir: codexWorkdir,
-		logger:       logger,
+		id:        "coder",
+		queue:     queue,
+		messenger: messenger,
+		store:     store,
+		files:     files,
+		generator: generator,
+		logger:    logger,
 	}
 }
 
@@ -272,7 +269,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				"elapsed_sec": int(elapsed.Seconds()),
 			})
 		})
-		plan, err := c.generatePlanWithCodex(runCtx, req)
+		plan, err := c.generator.Generate(runCtx, req)
 		stopProgress()
 		if err != nil {
 			c.logger.Printf("coder codex generation failed: %v", err)
@@ -511,82 +508,22 @@ func (r *Reviewer) handleMessage(ctx context.Context, msg domain.Message) {
 	}
 }
 
-func (c *Coder) generatePlanWithCodex(ctx context.Context, req domain.WorkRequestPayload) (codexPlan, error) {
-	schemaFile, err := os.CreateTemp("", "organ_codex_schema_*.json")
-	if err != nil {
-		return codexPlan{}, fmt.Errorf("create schema temp file: %w", err)
-	}
-	defer func() {
-		_ = os.Remove(schemaFile.Name())
-	}()
-	defer schemaFile.Close()
+type errorPlanGenerator struct {
+	err error
+}
 
-	schema := `{
-  "type":"object",
-  "additionalProperties":false,
-  "required":["summary","files"],
-  "properties":{
-    "summary":{"type":"string","minLength":1},
-    "files":{
-      "type":"array",
-      "minItems":1,
-      "items":{
-        "type":"object",
-        "additionalProperties":false,
-        "required":["path","content"],
-        "properties":{
-          "path":{"type":"string","minLength":1},
-          "content":{"type":"string"}
-        }
-      }
-    }
-  }
-}`
-	if _, err := schemaFile.WriteString(schema); err != nil {
-		return codexPlan{}, fmt.Errorf("write schema file: %w", err)
+func (g errorPlanGenerator) Generate(_ context.Context, _ domain.WorkRequestPayload) (codexPlan, error) {
+	if g.err == nil {
+		return codexPlan{}, errors.New("plan generator is not configured")
 	}
-
-	outFile, err := os.CreateTemp("", "organ_codex_output_*.json")
-	if err != nil {
-		return codexPlan{}, fmt.Errorf("create output temp file: %w", err)
-	}
-	defer func() {
-		_ = os.Remove(outFile.Name())
-	}()
-	outFile.Close()
-
-	prompt := buildCodexPrompt(req)
-	args := []string{
-		"exec",
-		"--skip-git-repo-check",
-		"--output-schema",
-		schemaFile.Name(),
-		"-o",
-		outFile.Name(),
-		prompt,
-	}
-	cmd := exec.CommandContext(ctx, c.codexBinary, args...)
-	cmd.Dir = c.codexWorkdir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return codexPlan{}, fmt.Errorf("codex exec failed: %w; output: %s", err, string(output))
-	}
-
-	raw, err := os.ReadFile(outFile.Name())
-	if err != nil {
-		return codexPlan{}, fmt.Errorf("read codex output: %w", err)
-	}
-	parsed, err := parseCodexOutput(raw)
-	if err != nil {
-		return codexPlan{}, fmt.Errorf("parse codex output: %w", err)
-	}
-	return parsed, nil
+	return codexPlan{}, g.err
 }
 
 func buildCodexPrompt(req domain.WorkRequestPayload) string {
 	var b strings.Builder
 	b.WriteString("Generate implementation files for the task.\n")
-	b.WriteString("Return only valid JSON matching the provided output schema.\n")
+	b.WriteString("Return only valid JSON with this exact shape:\n")
+	b.WriteString("{\"summary\":\"string\",\"files\":[{\"path\":\"string\",\"content\":\"string\"}]}\n")
 	b.WriteString("Do not wrap output in markdown fences.\n")
 	b.WriteString("Paths must be relative, must not start with '/' or contain '..'.\n")
 	b.WriteString("The result must be runnable and not a textual placeholder.\n\n")
@@ -626,6 +563,14 @@ func parseCodexOutput(raw []byte) (codexPlan, error) {
 
 	var plan codexPlan
 	if err := json.Unmarshal([]byte(text), &plan); err != nil {
+		start := strings.IndexByte(text, '{')
+		end := strings.LastIndexByte(text, '}')
+		if start >= 0 && end > start {
+			candidate := text[start : end+1]
+			if secondErr := json.Unmarshal([]byte(candidate), &plan); secondErr == nil {
+				return plan, nil
+			}
+		}
 		return codexPlan{}, err
 	}
 	return plan, nil

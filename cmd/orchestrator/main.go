@@ -92,8 +92,13 @@ func main() {
 	orch := orchestrator.New(store, policyEngine, bus, orchCfg, log.Default())
 	orch.Start(ctx)
 
+	coderGenerator, err := buildCoderPlanGenerator(cfg, log.Default())
+	if err != nil {
+		log.Fatalf("build coder plan generator: %v", err)
+	}
+
 	planner := agent.NewPlanner(bus, orch, store, log.Default())
-	coder := agent.NewCoder(bus, orch, store, files, "codex", workspaceRoot, log.Default())
+	coder := agent.NewCoder(bus, orch, store, files, coderGenerator, log.Default())
 	reviewer := agent.NewReviewer(bus, orch, store, log.Default())
 	planner.Start(ctx)
 	coder.Start(ctx)
@@ -512,4 +517,58 @@ func queryInt(r *http.Request, key string, def int) int {
 		return def
 	}
 	return v
+}
+
+func buildCoderPlanGenerator(cfg config.Config, logger *log.Logger) (agent.PlanGenerator, error) {
+	backend := strings.ToLower(firstNonEmpty(cfg.Orchestrator.CoderBackend, "api"))
+	if backend != "api" {
+		return nil, fmt.Errorf("unsupported coder_backend=%q (only \"api\" is supported)", backend)
+	}
+
+	providerName := strings.TrimSpace(cfg.ModelProvider)
+	if providerName == "" {
+		return nil, fmt.Errorf("model_provider is required")
+	}
+	provider, ok := cfg.ModelProviders[providerName]
+	if !ok {
+		return nil, fmt.Errorf("model_provider %q not found in model_providers", providerName)
+	}
+
+	model := strings.TrimSpace(cfg.Model)
+	if model == "" {
+		return nil, fmt.Errorf("model is required")
+	}
+	baseURL := strings.TrimSpace(provider.BaseURL)
+	wireAPI := strings.Trim(strings.TrimSpace(provider.WireAPI), "/")
+	if baseURL == "" || wireAPI == "" {
+		return nil, fmt.Errorf("provider %q must define base_url and wire_api", providerName)
+	}
+	endpoint := strings.TrimRight(baseURL, "/") + "/" + wireAPI
+
+	authTokenEnv := firstNonEmpty(cfg.Orchestrator.CoderAPIAuthTokenEnv, "OPENAI_API_KEY")
+	authToken := strings.TrimSpace(os.Getenv(authTokenEnv))
+	if provider.RequiresOpenAIAuth && authToken == "" && logger != nil {
+		logger.Printf(
+			"coder api provider=%s requires_openai_auth=true but env %s is empty; sending requests without Authorization header",
+			providerName,
+			authTokenEnv,
+		)
+	}
+
+	generator, err := agent.NewAPIPlanGenerator(agent.APIPlanGeneratorConfig{
+		Endpoint:        endpoint,
+		Model:           model,
+		ReasoningEffort: firstNonEmpty(cfg.ModelReasoningEffort, "high"),
+		AuthToken:       authToken,
+		Timeout:         durationMS(cfg.Orchestrator.CoderAPITimeoutMS, 8*time.Minute),
+		Retries:         intOrDefault(cfg.Orchestrator.CoderAPIRetries, 2),
+		RetryBackoff:    durationMS(cfg.Orchestrator.CoderAPIRetryBackoffMS, 1500*time.Millisecond),
+		MaxOutputTokens: intOrDefault(cfg.Orchestrator.CoderAPIMaxOutputTokens, 24000),
+		MaxOutputBytes:  intOrDefault(cfg.Orchestrator.CoderAPIMaxOutputBytes, 8*1024*1024),
+		Logger:          logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return generator, nil
 }
