@@ -105,7 +105,7 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 			logAction(ctx, p.store, msg.TaskID, p.id, "message_parse_failed", "planner failed to parse request payload", map[string]any{
 				"error": err.Error(),
 			})
-			_ = p.store.AckMessage(ctx, msg.ID, p.id, "bad payload")
+			ackMessageWithRetry(ctx, p.store, p.logger, msg.ID, p.id, "bad payload")
 			return
 		}
 		plan := domain.PlanProposalPayload{
@@ -149,17 +149,17 @@ func (p *Planner) handleMessage(ctx context.Context, msg domain.Message) {
 				"correlation_id": msg.CorrelationID,
 			})
 		}
-		_ = p.store.AckMessage(ctx, msg.ID, p.id, result)
+		ackMessageWithRetry(ctx, p.store, p.logger, msg.ID, p.id, result)
 	case domain.MessageTypeBlocked, domain.MessageTypeEscalate:
 		logAction(ctx, p.store, msg.TaskID, p.id, "blocked_or_escalated", "planner received blocked/escalate", map[string]any{
 			"type": msg.Type,
 		})
-		_ = p.store.AckMessage(ctx, msg.ID, p.id, "planner received blocked/escalate")
+		ackMessageWithRetry(ctx, p.store, p.logger, msg.ID, p.id, "planner received blocked/escalate")
 	default:
 		logAction(ctx, p.store, msg.TaskID, p.id, "message_ignored", "planner ignored unsupported message type", map[string]any{
 			"type": msg.Type,
 		})
-		_ = p.store.AckMessage(ctx, msg.ID, p.id, "planner ignored message type")
+		ackMessageWithRetry(ctx, p.store, p.logger, msg.ID, p.id, "planner ignored message type")
 	}
 }
 
@@ -249,7 +249,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 	case domain.MessageTypeRequest:
 		var req domain.WorkRequestPayload
 		if err := json.Unmarshal(msg.Payload, &req); err != nil {
-			_ = c.store.AckMessage(ctx, msg.ID, c.id, "bad payload")
+			ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, "bad payload")
 			c.logger.Printf("coder parse request failed: %v", err)
 			logAction(ctx, c.store, msg.TaskID, c.id, "message_parse_failed", "coder failed to parse request payload", map[string]any{
 				"error": err.Error(),
@@ -289,7 +289,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				CorrelationID:  msg.CorrelationID,
 				IdempotencyKey: "coder-blocked-" + msg.ID,
 			})
-			_ = c.store.AckMessage(ctx, msg.ID, c.id, "generation failed")
+			ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, "generation failed")
 			return
 		}
 
@@ -308,7 +308,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				CorrelationID:  msg.CorrelationID,
 				IdempotencyKey: "coder-blocked-empty-" + msg.ID,
 			})
-			_ = c.store.AckMessage(ctx, msg.ID, c.id, "empty plan")
+			ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, "empty plan")
 			return
 		}
 		logAction(ctx, c.store, msg.TaskID, c.id, "codex_exec_finished", "coder received file plan from codex", map[string]any{
@@ -377,7 +377,7 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				CorrelationID:  msg.CorrelationID,
 				IdempotencyKey: "coder-blocked-write-" + msg.ID,
 			})
-			_ = c.store.AckMessage(ctx, msg.ID, c.id, "no files created")
+			ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, "no files created")
 			return
 		}
 
@@ -406,12 +406,12 @@ func (c *Coder) handleMessage(ctx context.Context, msg domain.Message) {
 				"node_id":             req.NodeID,
 			})
 		}
-		_ = c.store.AckMessage(ctx, msg.ID, c.id, fmt.Sprintf("completed, created %d files", len(createdFiles)))
+		ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, fmt.Sprintf("completed, created %d files", len(createdFiles)))
 	default:
 		logAction(ctx, c.store, msg.TaskID, c.id, "message_ignored", "coder ignored unsupported message type", map[string]any{
 			"type": msg.Type,
 		})
-		_ = c.store.AckMessage(ctx, msg.ID, c.id, "coder ignored message type")
+		ackMessageWithRetry(ctx, c.store, c.logger, msg.ID, c.id, "coder ignored message type")
 	}
 }
 
@@ -445,7 +445,7 @@ func (r *Reviewer) handleMessage(ctx context.Context, msg domain.Message) {
 	case domain.MessageTypeReview:
 		var req domain.ReviewRequestPayload
 		if err := json.Unmarshal(msg.Payload, &req); err != nil {
-			_ = r.store.AckMessage(ctx, msg.ID, r.id, "bad payload")
+			ackMessageWithRetry(ctx, r.store, r.logger, msg.ID, r.id, "bad payload")
 			logAction(ctx, r.store, msg.TaskID, r.id, "message_parse_failed", "reviewer failed to parse review payload", map[string]any{
 				"error": err.Error(),
 			})
@@ -465,7 +465,7 @@ func (r *Reviewer) handleMessage(ctx context.Context, msg domain.Message) {
 				CorrelationID:  msg.CorrelationID,
 				IdempotencyKey: "reviewer-blocked-" + msg.ID,
 			})
-			_ = r.store.AckMessage(ctx, msg.ID, r.id, "review failed")
+			ackMessageWithRetry(ctx, r.store, r.logger, msg.ID, r.id, "review failed")
 			logAction(ctx, r.store, msg.TaskID, r.id, "review_failed", "reviewer rejected result payload", map[string]any{
 				"node_id":     req.NodeID,
 				"summary_len": len(strings.TrimSpace(req.Summary)),
@@ -492,16 +492,16 @@ func (r *Reviewer) handleMessage(ctx context.Context, msg domain.Message) {
 			logAction(ctx, r.store, msg.TaskID, r.id, "done_send_failed", "reviewer failed to send DONE", map[string]any{
 				"error": err.Error(),
 			})
-			_ = r.store.AckMessage(ctx, msg.ID, r.id, "done send failed")
+			ackMessageWithRetry(ctx, r.store, r.logger, msg.ID, r.id, "done send failed")
 			return
 		}
 		logAction(ctx, r.store, msg.TaskID, r.id, "done_sent", "reviewer approved and sent DONE", map[string]any{
 			"node_id":     req.NodeID,
 			"files_count": len(req.CreatedFiles),
 		})
-		_ = r.store.AckMessage(ctx, msg.ID, r.id, "review completed")
+		ackMessageWithRetry(ctx, r.store, r.logger, msg.ID, r.id, "review completed")
 	default:
-		_ = r.store.AckMessage(ctx, msg.ID, r.id, "reviewer ignored message type")
+		ackMessageWithRetry(ctx, r.store, r.logger, msg.ID, r.id, "reviewer ignored message type")
 		logAction(ctx, r.store, msg.TaskID, r.id, "message_ignored", "reviewer ignored unsupported message type", map[string]any{
 			"type": msg.Type,
 		})
@@ -614,13 +614,64 @@ func logAction(ctx context.Context, store Store, taskID string, actor string, ac
 	if payload != nil {
 		raw = mustJSON(payload)
 	}
-	_ = store.LogDecision(ctx, domain.DecisionLog{
-		TaskID:  taskID,
-		Actor:   actor,
-		Action:  action,
-		Reason:  reason,
-		Payload: raw,
+	_ = retryTransientStoreWrite(ctx, func() error {
+		return store.LogDecision(ctx, domain.DecisionLog{
+			TaskID:  taskID,
+			Actor:   actor,
+			Action:  action,
+			Reason:  reason,
+			Payload: raw,
+		})
 	})
+}
+
+func ackMessageWithRetry(ctx context.Context, store Store, logger *log.Logger, messageID string, agentID string, result string) {
+	if store == nil {
+		return
+	}
+	err := retryTransientStoreWrite(ctx, func() error {
+		return store.AckMessage(ctx, messageID, agentID, result)
+	})
+	if err != nil && logger != nil {
+		logger.Printf("ack message failed message_id=%s agent=%s: %v", messageID, agentID, err)
+	}
+}
+
+func retryTransientStoreWrite(ctx context.Context, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isTransientStoreErr(err) {
+			return err
+		}
+		delay := time.Duration(30*(attempt+1)) * time.Millisecond
+		if ctx == nil {
+			time.Sleep(delay)
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func isTransientStoreErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "sqlite_busy") ||
+		strings.Contains(msg, "busy")
 }
 
 func startProgressHeartbeat(ctx context.Context, interval time.Duration, onTick func(elapsed time.Duration)) func() {

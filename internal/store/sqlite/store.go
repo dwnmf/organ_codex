@@ -141,12 +141,16 @@ func Open(dbPath string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxIdleTime(0)
+	db.SetConnMaxLifetime(0)
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
 		"PRAGMA synchronous=NORMAL;",
 		"PRAGMA foreign_keys=ON;",
-		"PRAGMA busy_timeout=5000;",
+		"PRAGMA busy_timeout=15000;",
 	}
 	for _, stmt := range pragmas {
 		if _, err := db.Exec(stmt); err != nil {

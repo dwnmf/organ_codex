@@ -187,7 +187,7 @@ func (s *Service) CreateTask(ctx context.Context, in CreateTaskInput) (domain.Ta
 	if err := s.store.CreateTask(ctx, task); err != nil {
 		return domain.Task{}, err
 	}
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID:  task.ID,
 		Actor:   orchestratorAgentID,
 		Action:  "task_created",
@@ -225,7 +225,7 @@ func (s *Service) GrantPermission(ctx context.Context, permission domain.TaskPer
 	if err := s.store.GrantTaskPermission(ctx, permission); err != nil {
 		return err
 	}
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID:  permission.TaskID,
 		Actor:   orchestratorAgentID,
 		Action:  "permission_granted",
@@ -239,7 +239,7 @@ func (s *Service) GrantChannel(ctx context.Context, channel domain.AgentChannel)
 	if err := s.store.GrantAgentChannel(ctx, channel); err != nil {
 		return err
 	}
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID:  channel.TaskID,
 		Actor:   orchestratorAgentID,
 		Action:  "channel_granted",
@@ -257,7 +257,7 @@ func (s *Service) StartTask(ctx context.Context, taskID string) error {
 	if task.Status == domain.TaskStatusDone || task.Status == domain.TaskStatusFailed || task.Status == domain.TaskStatusCanceled {
 		return fmt.Errorf("task %s is already final (%s)", task.ID, task.Status)
 	}
-	if err := s.store.UpdateTaskStatus(ctx, taskID, domain.TaskStatusRunning, ""); err != nil {
+	if err := s.updateTaskStatusWithRetry(ctx, taskID, domain.TaskStatusRunning, ""); err != nil {
 		return err
 	}
 
@@ -333,7 +333,7 @@ func (s *Service) EnqueueMessage(ctx context.Context, msg domain.Message) error 
 			return fmt.Errorf("message policy check: %w", err)
 		}
 		if !allowed {
-			_ = s.store.LogDecision(ctx, domain.DecisionLog{
+			_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 				TaskID: msg.TaskID,
 				Actor:  orchestratorAgentID,
 				Action: "message_denied",
@@ -426,7 +426,7 @@ func (s *Service) dispatchOnce(ctx context.Context) error {
 				continue
 			}
 			if !shouldRetry {
-				_ = s.store.LogDecision(ctx, domain.DecisionLog{
+				_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 					TaskID: msg.TaskID,
 					Actor:  orchestratorAgentID,
 					Action: "message_failed",
@@ -484,7 +484,7 @@ func (s *Service) requeueExpiredInFlightMessages(ctx context.Context, now time.T
 			continue
 		}
 		if shouldRetry {
-			_ = s.store.LogDecision(ctx, domain.DecisionLog{
+			_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 				TaskID: msg.TaskID,
 				Actor:  orchestratorAgentID,
 				Action: "message_requeued",
@@ -500,7 +500,7 @@ func (s *Service) requeueExpiredInFlightMessages(ctx context.Context, now time.T
 			continue
 		}
 
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID: msg.TaskID,
 			Actor:  orchestratorAgentID,
 			Action: "message_failed",
@@ -545,11 +545,11 @@ func (s *Service) orchestratorInboxLoop(ctx context.Context) {
 }
 
 func (s *Service) handleOrchestratorMessage(ctx context.Context, msg domain.Message) {
-	_ = s.store.AckMessage(ctx, msg.ID, orchestratorAgentID, "received")
-	_ = s.store.TouchTask(ctx, msg.TaskID)
+	s.ackMessageWithRetry(ctx, msg.ID, orchestratorAgentID, "received")
+	s.touchTaskWithRetry(ctx, msg.TaskID)
 	task, err := s.store.GetTask(ctx, msg.TaskID)
 	if err == nil && isFinalStatus(task.Status) {
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID: msg.TaskID,
 			Actor:  orchestratorAgentID,
 			Action: "final_message_ignored",
@@ -589,8 +589,10 @@ func (s *Service) handleOrchestratorMessage(ctx context.Context, msg domain.Mess
 			})
 			return
 		}
-		_ = s.store.UpdateTaskStatus(ctx, msg.TaskID, domain.TaskStatusDone, "")
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		if err := s.updateTaskStatusWithRetry(ctx, msg.TaskID, domain.TaskStatusDone, ""); err != nil {
+			s.logger.Printf("update task done failed task=%s: %v", msg.TaskID, err)
+		}
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID:  msg.TaskID,
 			Actor:   orchestratorAgentID,
 			Action:  "task_done",
@@ -605,7 +607,7 @@ func (s *Service) handleOrchestratorMessage(ctx context.Context, msg domain.Mess
 			"payload":    json.RawMessage(msg.Payload),
 		})
 	default:
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID:  msg.TaskID,
 			Actor:   orchestratorAgentID,
 			Action:  "orchestrator_message_received",
@@ -657,7 +659,7 @@ func (s *Service) handlePlanProposalMessage(ctx context.Context, msg domain.Mess
 	s.planMu.Lock()
 	if _, exists := s.plans[msg.TaskID]; exists {
 		s.planMu.Unlock()
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID: msg.TaskID,
 			Actor:  orchestratorAgentID,
 			Action: "plan_proposal_ignored",
@@ -672,7 +674,7 @@ func (s *Service) handlePlanProposalMessage(ctx context.Context, msg domain.Mess
 	s.plans[msg.TaskID] = plan
 	s.planMu.Unlock()
 
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID: msg.TaskID,
 		Actor:  orchestratorAgentID,
 		Action: "plan_registered",
@@ -727,7 +729,7 @@ func (s *Service) handlePlanNodeDone(ctx context.Context, msg domain.Message) bo
 		return true
 	}
 
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID: msg.TaskID,
 		Actor:  orchestratorAgentID,
 		Action: "plan_node_done",
@@ -899,7 +901,7 @@ func (s *Service) dispatchReadyPlanNodes(ctx context.Context, taskID string, tas
 		}); err != nil {
 			return err
 		}
-		_ = s.store.LogDecision(ctx, domain.DecisionLog{
+		_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 			TaskID: taskID,
 			Actor:  orchestratorAgentID,
 			Action: "plan_node_dispatched",
@@ -1016,8 +1018,10 @@ func (s *Service) finalizeTaskFromPlan(ctx context.Context, taskID string) {
 		})
 		return
 	}
-	_ = s.store.UpdateTaskStatus(ctx, taskID, domain.TaskStatusDone, "")
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	if err := s.updateTaskStatusWithRetry(ctx, taskID, domain.TaskStatusDone, ""); err != nil {
+		s.logger.Printf("finalize task status update failed task=%s: %v", taskID, err)
+	}
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID:  taskID,
 		Actor:   orchestratorAgentID,
 		Action:  "task_done",
@@ -1092,8 +1096,10 @@ func (s *Service) watchdogOnce(ctx context.Context) {
 			task.Status != domain.TaskStatusDone &&
 			task.Status != domain.TaskStatusFailed &&
 			task.Status != domain.TaskStatusCanceled {
-			_ = s.store.UpdateTaskStatus(ctx, task.ID, domain.TaskStatusFailed, "deadline exceeded")
-			_ = s.store.LogDecision(ctx, domain.DecisionLog{
+			if err := s.updateTaskStatusWithRetry(ctx, task.ID, domain.TaskStatusFailed, "deadline exceeded"); err != nil {
+				s.logger.Printf("watchdog set failed status task=%s: %v", task.ID, err)
+			}
+			_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 				TaskID:  task.ID,
 				Actor:   orchestratorAgentID,
 				Action:  "task_failed",
@@ -1121,8 +1127,10 @@ func (s *Service) watchdogOnce(ctx context.Context) {
 				}
 			}
 			if active == 0 && now.Sub(task.UpdatedAt) > s.cfg.IdleTimeout {
-				_ = s.store.UpdateTaskStatus(ctx, task.ID, domain.TaskStatusBlocked, "idle timeout exceeded")
-				_ = s.store.LogDecision(ctx, domain.DecisionLog{
+				if err := s.updateTaskStatusWithRetry(ctx, task.ID, domain.TaskStatusBlocked, "idle timeout exceeded"); err != nil {
+					s.logger.Printf("watchdog set blocked status task=%s: %v", task.ID, err)
+				}
+				_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 					TaskID: task.ID,
 					Actor:  orchestratorAgentID,
 					Action: "task_blocked",
@@ -1172,8 +1180,10 @@ func (s *Service) blockTaskIfNonFinal(ctx context.Context, taskID string, reason
 	if isFinalStatus(task.Status) {
 		return
 	}
-	_ = s.store.UpdateTaskStatus(ctx, taskID, domain.TaskStatusBlocked, reason)
-	_ = s.store.LogDecision(ctx, domain.DecisionLog{
+	if err := s.updateTaskStatusWithRetry(ctx, taskID, domain.TaskStatusBlocked, reason); err != nil {
+		s.logger.Printf("block task status update failed task=%s: %v", taskID, err)
+	}
+	_ = s.logDecisionWithRetry(ctx, domain.DecisionLog{
 		TaskID:  taskID,
 		Actor:   orchestratorAgentID,
 		Action:  "task_blocked",
@@ -1187,6 +1197,50 @@ func (s *Service) clearTaskPlan(taskID string) {
 	s.planMu.Lock()
 	defer s.planMu.Unlock()
 	delete(s.plans, taskID)
+}
+
+func (s *Service) retryStoreWrite(fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isSQLiteBusy(err) {
+			return err
+		}
+		time.Sleep(time.Duration(30*(attempt+1)) * time.Millisecond)
+	}
+	return lastErr
+}
+
+func (s *Service) ackMessageWithRetry(ctx context.Context, messageID string, agentID string, result string) {
+	if err := s.retryStoreWrite(func() error {
+		return s.store.AckMessage(ctx, messageID, agentID, result)
+	}); err != nil {
+		s.logger.Printf("ack message failed message_id=%s agent=%s: %v", messageID, agentID, err)
+	}
+}
+
+func (s *Service) touchTaskWithRetry(ctx context.Context, taskID string) {
+	if err := s.retryStoreWrite(func() error {
+		return s.store.TouchTask(ctx, taskID)
+	}); err != nil {
+		s.logger.Printf("touch task failed task_id=%s: %v", taskID, err)
+	}
+}
+
+func (s *Service) updateTaskStatusWithRetry(ctx context.Context, taskID string, status domain.TaskStatus, lastError string) error {
+	return s.retryStoreWrite(func() error {
+		return s.store.UpdateTaskStatus(ctx, taskID, status, lastError)
+	})
+}
+
+func (s *Service) logDecisionWithRetry(ctx context.Context, entry domain.DecisionLog) error {
+	return s.retryStoreWrite(func() error {
+		return s.store.LogDecision(ctx, entry)
+	})
 }
 
 func isFinalStatus(status domain.TaskStatus) bool {
